@@ -28,6 +28,7 @@ import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerInteractAtEntityEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerItemHeldEvent;
@@ -36,6 +37,7 @@ import org.bukkit.event.vehicle.VehicleDamageEvent;
 import org.bukkit.event.vehicle.VehicleDestroyEvent;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
 import org.bukkit.event.vehicle.VehicleExitEvent;
+import org.bukkit.event.world.EntitiesLoadEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
@@ -76,6 +78,12 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private static final int GEAR_FIRST = 1;
     private static final int GEAR_SECOND = 2;
     private static final int GEAR_THIRD = 3;
+
+    // Смещение всей модели относительно точки посадки пассажира на вагонетке.
+    // Если колёса уходят в землю — увеличьте MODEL_OFFSET_Y (например -0.52f -> -0.40f).
+    // Если кузов висит над землёй — уменьшите (например -0.52f -> -0.60f).
+    private static final float MODEL_OFFSET_Y = -0.52f;
+    private static final float MODEL_OFFSET_Z = -0.15f;
 
     private NamespacedKey carKey;
     private NamespacedKey carPartKey;
@@ -222,7 +230,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
     // ==================== 3D-МОДЕЛЬ АВТОМОБИЛЯ (BLOCK DISPLAY КАК ПАССАЖИРЫ) ====================
     // Важно: когда BlockDisplay сидит пассажиром на вагонетке, точка крепления пассажира в Minecraft
-    // находится на высоте y ≈ +0.525 от низа вагонетки, поэтому все Y-координаты деталей опущены на -0.52f,
+    // находится выше низа вагонетки, поэтому все Y-координаты деталей сдвигаются на MODEL_OFFSET_Y,
     // а сама модель сдвинута так, чтобы водитель сидел строго в салоне и полностью закрывал вагонетку.
 
     private BlockDisplay createModelPart(Minecart cart, World world, Location origin, UUID carId, Material mat,
@@ -232,7 +240,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         BlockDisplay display = (BlockDisplay) world.spawnEntity(origin, EntityType.BLOCK_DISPLAY);
         display.setBlock(mat.createBlockData());
         display.setTransformation(new Transformation(
-                new Vector3f(tx, ty - 0.52f, tz - 0.15f),
+                new Vector3f(tx, ty + MODEL_OFFSET_Y, tz + MODEL_OFFSET_Z),
                 new AxisAngle4f(0, 0, 1, 0),
                 new Vector3f(sx, sy, sz),
                 new AxisAngle4f(0, 0, 1, 0)
@@ -395,6 +403,20 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 if (bd != null && bd.isValid()) {
                     bd.remove();
                 }
+            }
+        }
+        // Детали модели сохраняются в мире вместе с вагонеткой (как её пассажиры).
+        // После перезагрузки чанка плагин о них не знает, поэтому чистим и по списку пассажиров.
+        if (Bukkit.getEntity(carId) instanceof Minecart cart) {
+            purgeModelParts(cart);
+        }
+    }
+
+    private void purgeModelParts(Minecart cart) {
+        for (Entity passenger : new ArrayList<>(cart.getPassengers())) {
+            if (passenger instanceof BlockDisplay bd
+                    && bd.getPersistentDataContainer().has(carPartKey, PersistentDataType.STRING)) {
+                bd.remove();
             }
         }
     }
@@ -684,6 +706,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     // Взаимодействие ПКМ по машине (или по её 3D-деталям)
     @EventHandler
     public void onInteractCar(PlayerInteractEntityEvent event) {
+        // Клиент шлёт два пакета (INTERACT_AT и INTERACT), и Bukkit вызывает событие дважды
+        // (PlayerInteractAtEntityEvent — подкласс PlayerInteractEntityEvent).
+        // Обрабатываем только одно, иначе бак открывается/закрывается дважды.
+        if (event instanceof PlayerInteractAtEntityEvent) return;
         if (event.getHand() != EquipmentSlot.HAND) return;
 
         Minecart cart = null;
@@ -863,6 +889,30 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_BARREL_OPEN, 0.8f, 1.0f);
             }
         }
+    }
+
+    // Детали модели хранятся в мире как пассажиры вагонетки. После выгрузки и повторной загрузки чанка
+    // старые детали остаются, а плагин о них уже не знает: без этого при посадке создавался бы второй
+    // комплект деталей. Убираем старые и собираем модель заново.
+    @EventHandler
+    public void onEntitiesLoad(EntitiesLoadEvent event) {
+        List<Entity> loaded = new ArrayList<>(event.getEntities());
+        Bukkit.getScheduler().runTask(this, () -> {
+            for (Entity entity : loaded) {
+                if (entity instanceof BlockDisplay bd && bd.isValid()
+                        && bd.getPersistentDataContainer().has(carPartKey, PersistentDataType.STRING)) {
+                    bd.remove();
+                }
+            }
+            for (Entity entity : loaded) {
+                if (entity instanceof Minecart cart && cart.isValid() && isCar(cart)) {
+                    cart.setInvisible(true);
+                    cart.setCustomNameVisible(false);
+                    trackedCars.add(cart.getUniqueId());
+                    spawnCarModel(cart);
+                }
+            }
+        });
     }
 
     @EventHandler
