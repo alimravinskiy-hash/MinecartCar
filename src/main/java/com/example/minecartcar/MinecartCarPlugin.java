@@ -2,12 +2,14 @@ package com.example.minecartcar;
 
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
+import org.bukkit.Color;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
+import org.bukkit.Tag;
 import org.bukkit.block.Block;
 import org.bukkit.block.data.Levelled;
 import org.bukkit.entity.EntityType;
@@ -190,27 +192,46 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private boolean isPassable(Block block) {
+        if (block.isPassable()) return true;
+        Material type = block.getType();
+        return type == Material.DIRT_PATH || type == Material.FARMLAND || type == Material.SOUL_SAND || type == Material.MUD;
+    }
+
     private boolean hasGroundTraction(Minecart cart) {
         if (cart.isOnGround()) return true;
-        Block below = cart.getLocation().subtract(0, 0.3, 0).getBlock();
-        return below.getType().isSolid();
+        Block below = cart.getLocation().subtract(0, 0.35, 0).getBlock();
+        return !below.isPassable();
     }
 
     private boolean canStepUp(Minecart cart, Vector moveDir) {
-        Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.35);
-        Location base = cart.getLocation().add(0, 0.1, 0);
+        Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.45);
+        Location base = cart.getLocation().add(0, 0.25, 0);
 
-        Location[] wheels = new Location[]{
-                base.clone().add(moveDir.clone().multiply(0.95)).add(side),
-                base.clone().add(moveDir.clone().multiply(0.95)).subtract(side)
-        };
+        double[] distances = new double[]{0.75, 1.15};
+        for (double dist : distances) {
+            Location center = base.clone().add(moveDir.clone().multiply(dist));
+            Location[] checkPoints = new Location[]{
+                    center,
+                    center.clone().add(side),
+                    center.clone().subtract(side)
+            };
 
-        for (Location wheelLoc : wheels) {
-            Block front = wheelLoc.getBlock();
-            Block above1 = front.getRelative(0, 1, 0);
-            Block above2 = front.getRelative(0, 2, 0);
-            if (front.getType().isSolid() && !above1.getType().isSolid() && !above2.getType().isSolid()) {
-                return true;
+            for (Location pt : checkPoints) {
+                Block front = pt.getBlock();
+                if (front.isPassable() || front.getType() == Material.DIRT_PATH) {
+                    continue;
+                }
+                if (Tag.FENCES.isTagged(front.getType()) || Tag.WALLS.isTagged(front.getType())) {
+                    continue;
+                }
+
+                Block above1 = front.getRelative(0, 1, 0);
+                Block above2 = front.getRelative(0, 2, 0);
+
+                if (isPassable(above1) && isPassable(above2)) {
+                    return true;
+                }
             }
         }
         return false;
@@ -219,21 +240,24 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private void updateHeadlights(Minecart cart, Vector forward) {
         if (!areHeadlightsOn(cart)) return;
 
-        Vector right = new Vector(-forward.getZ(), 0, forward.getX()).multiply(0.32);
-        Location frontCenter = cart.getLocation().add(forward.clone().multiply(0.65)).add(0, 0.45, 0);
+        // Мягкие, аккуратные частицы фар раз в 3 тика, чтобы не перекрывать обзор
+        if (tickCounter % 3 == 0) {
+            Vector right = new Vector(-forward.getZ(), 0, forward.getX()).multiply(0.32);
+            Location frontCenter = cart.getLocation().add(forward.clone().multiply(0.65)).add(0, 0.42, 0);
 
-        Location leftLight = frontCenter.clone().subtract(right);
-        Location rightLight = frontCenter.clone().add(right);
+            Location leftLight = frontCenter.clone().subtract(right);
+            Location rightLight = frontCenter.clone().add(right);
 
-        cart.getWorld().spawnParticle(Particle.END_ROD, leftLight, 1, 0.02, 0.02, 0.02, 0.0);
-        cart.getWorld().spawnParticle(Particle.END_ROD, rightLight, 1, 0.02, 0.02, 0.02, 0.0);
+            Particle.DustOptions warmLight = new Particle.DustOptions(Color.fromRGB(255, 240, 170), 0.75f);
+            cart.getWorld().spawnParticle(Particle.DUST, leftLight, 1, 0.01, 0.01, 0.01, 0.0, warmLight);
+            cart.getWorld().spawnParticle(Particle.DUST, rightLight, 1, 0.01, 0.01, 0.01, 0.0, warmLight);
 
-        for (int i = 1; i <= 4; i++) {
-            Vector beamOffset = forward.clone().multiply(i * 0.9);
-            cart.getWorld().spawnParticle(Particle.WAX_ON, leftLight.clone().add(beamOffset), 1, 0.08, 0.05, 0.08, 0.0);
-            cart.getWorld().spawnParticle(Particle.WAX_ON, rightLight.clone().add(beamOffset), 1, 0.08, 0.05, 0.08, 0.0);
+            Vector beamOffset = forward.clone().multiply(1.8);
+            cart.getWorld().spawnParticle(Particle.DUST, leftLight.clone().add(beamOffset), 1, 0.05, 0.02, 0.05, 0.0, warmLight);
+            cart.getWorld().spawnParticle(Particle.DUST, rightLight.clone().add(beamOffset), 1, 0.05, 0.02, 0.05, 0.0, warmLight);
         }
 
+        // Реальное освещение дороги впереди невидимым блоком света
         if (tickCounter % 2 == 0) {
             Block targetBlock = cart.getLocation().add(forward.clone().multiply(3.5)).add(0, 1.0, 0).getBlock();
             Block prevBlock = activeLightBlocks.get(cart.getUniqueId());
@@ -277,6 +301,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         boolean onGround = hasGroundTraction(cart);
 
         if (speed != 0.0) {
+            // Плотный выхлопной дым сзади машины оставлен как раньше
             Location exhaust = cart.getLocation().subtract(forward.clone().multiply(0.7)).add(0, 0.25, 0);
             cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.08, 0.05, 0.08, 0.01);
             if (tickCounter % 3 == 0) {
@@ -289,7 +314,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 double yVel = velocity.getY();
 
                 if (canStepUp(cart, moveDir)) {
-                    yVel = 0.48;
+                    yVel = 0.56;
                 }
 
                 cart.setVelocity(new Vector(move.getX(), yVel, move.getZ()));
