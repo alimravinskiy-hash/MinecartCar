@@ -9,6 +9,7 @@ import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.block.Block;
+import org.bukkit.block.data.Levelled;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Minecart;
 import org.bukkit.entity.Player;
@@ -16,6 +17,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.event.vehicle.VehicleDestroyEvent;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
 import org.bukkit.event.vehicle.VehicleExitEvent;
@@ -27,17 +29,24 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
     private static final double MAX_SPEED = 0.70;
     private NamespacedKey carKey;
+    private NamespacedKey headlightsKey;
     private int tickCounter = 0;
+
+    private final Map<UUID, Block> activeLightBlocks = new HashMap<>();
 
     @Override
     public void onEnable() {
         carKey = new NamespacedKey(this, "custom_car");
+        headlightsKey = new NamespacedKey(this, "headlights_on");
         Bukkit.getPluginManager().registerEvents(this, this);
         registerCarRecipe();
 
@@ -51,6 +60,16 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }, 1L, 1L);
     }
 
+    @Override
+    public void onDisable() {
+        for (Block block : activeLightBlocks.values()) {
+            if (block.getType() == Material.LIGHT) {
+                block.setType(Material.AIR, false);
+            }
+        }
+        activeLightBlocks.clear();
+    }
+
     private ItemStack createCarItem() {
         ItemStack item = new ItemStack(Material.MINECART);
         ItemMeta meta = item.getItemMeta();
@@ -58,7 +77,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             meta.displayName(Component.text("§6§lАвтомобиль"));
             meta.lore(List.of(
                     Component.text("§7Поставьте на землю и сядьте (ПКМ)"),
-                    Component.text("§eW/S — газ/тормоз | Пробел — гудок")
+                    Component.text("§eW/S — газ/тормоз | F — фары | Пробел — гудок")
             ));
             meta.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, (byte) 1);
             item.setItemMeta(meta);
@@ -83,6 +102,35 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private boolean isCarItem(ItemStack item) {
         if (item == null || item.getType() != Material.MINECART || !item.hasItemMeta()) return false;
         return item.getItemMeta().getPersistentDataContainer().has(carKey, PersistentDataType.BYTE);
+    }
+
+    private boolean areHeadlightsOn(Minecart cart) {
+        return cart.getPersistentDataContainer().getOrDefault(headlightsKey, PersistentDataType.BYTE, (byte) 0) == (byte) 1;
+    }
+
+    private void clearLight(UUID cartId) {
+        Block oldBlock = activeLightBlocks.remove(cartId);
+        if (oldBlock != null && oldBlock.getType() == Material.LIGHT) {
+            oldBlock.setType(Material.AIR, false);
+        }
+    }
+
+    @EventHandler
+    public void onToggleHeadlights(PlayerSwapHandItemsEvent event) {
+        Player player = event.getPlayer();
+        if (player.getVehicle() instanceof Minecart cart && isCar(cart)) {
+            event.setCancelled(true);
+            boolean newState = !areHeadlightsOn(cart);
+            cart.getPersistentDataContainer().set(headlightsKey, PersistentDataType.BYTE, newState ? (byte) 1 : (byte) 0);
+
+            if (!newState) {
+                clearLight(cart.getUniqueId());
+                player.sendActionBar(Component.text("§7Фары: §cВЫКЛ"));
+            } else {
+                player.sendActionBar(Component.text("§7Фары: §eВКЛ"));
+            }
+            cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_LEVER_CLICK, 0.9f, newState ? 1.4f : 1.0f);
+        }
     }
 
     @EventHandler
@@ -116,6 +164,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     public void onBreakCar(VehicleDestroyEvent event) {
         if (event.getVehicle() instanceof Minecart cart && isCar(cart)) {
             event.setCancelled(true);
+            clearLight(cart.getUniqueId());
             cart.remove();
             cart.getWorld().dropItemNaturally(cart.getLocation(), createCarItem());
         }
@@ -128,7 +177,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             cart.setDerailedVelocityMod(new Vector(0.95, 0.95, 0.95));
             cart.setMaxSpeed(1.5);
             cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_PISTON_EXTEND, 0.8f, 0.6f);
-            player.sendActionBar(Component.text("§eW/S — газ/тормоз | Камера — руль | Пробел — гудок"));
+            player.sendActionBar(Component.text("§eW/S — газ/тормоз | F — фары | Пробел — гудок"));
         }
     }
 
@@ -136,15 +185,72 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     public void onExit(VehicleExitEvent event) {
         if (event.getVehicle() instanceof Minecart cart && isCar(cart)) {
             cart.setVelocity(new Vector(0, 0, 0));
+            clearLight(cart.getUniqueId());
             cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_PISTON_CONTRACT, 0.8f, 0.6f);
         }
     }
 
-    // Проверяем, стоят ли колеса машины на твердой опоре (включая полублоки и ступеньки)
     private boolean hasGroundTraction(Minecart cart) {
         if (cart.isOnGround()) return true;
-        Block below = cart.getLocation().subtract(0, 0.25, 0).getBlock();
+        Block below = cart.getLocation().subtract(0, 0.3, 0).getBlock();
         return below.getType().isSolid();
+    }
+
+    private boolean canStepUp(Minecart cart, Vector moveDir) {
+        Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.35);
+        Location base = cart.getLocation().add(0, 0.1, 0);
+
+        Location[] wheels = new Location[]{
+                base.clone().add(moveDir.clone().multiply(0.95)).add(side),
+                base.clone().add(moveDir.clone().multiply(0.95)).subtract(side)
+        };
+
+        for (Location wheelLoc : wheels) {
+            Block front = wheelLoc.getBlock();
+            Block above1 = front.getRelative(0, 1, 0);
+            Block above2 = front.getRelative(0, 2, 0);
+            if (front.getType().isSolid() && !above1.getType().isSolid() && !above2.getType().isSolid()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void updateHeadlights(Minecart cart, Vector forward) {
+        if (!areHeadlightsOn(cart)) return;
+
+        Vector right = new Vector(-forward.getZ(), 0, forward.getX()).multiply(0.32);
+        Location frontCenter = cart.getLocation().add(forward.clone().multiply(0.65)).add(0, 0.45, 0);
+
+        Location leftLight = frontCenter.clone().subtract(right);
+        Location rightLight = frontCenter.clone().add(right);
+
+        cart.getWorld().spawnParticle(Particle.END_ROD, leftLight, 1, 0.02, 0.02, 0.02, 0.0);
+        cart.getWorld().spawnParticle(Particle.END_ROD, rightLight, 1, 0.02, 0.02, 0.02, 0.0);
+
+        for (int i = 1; i <= 4; i++) {
+            Vector beamOffset = forward.clone().multiply(i * 0.9);
+            cart.getWorld().spawnParticle(Particle.WAX_ON, leftLight.clone().add(beamOffset), 1, 0.08, 0.05, 0.08, 0.0);
+            cart.getWorld().spawnParticle(Particle.WAX_ON, rightLight.clone().add(beamOffset), 1, 0.08, 0.05, 0.08, 0.0);
+        }
+
+        if (tickCounter % 2 == 0) {
+            Block targetBlock = cart.getLocation().add(forward.clone().multiply(3.5)).add(0, 1.0, 0).getBlock();
+            Block prevBlock = activeLightBlocks.get(cart.getUniqueId());
+
+            if (prevBlock != null && !prevBlock.equals(targetBlock) && prevBlock.getType() == Material.LIGHT) {
+                prevBlock.setType(Material.AIR, false);
+            }
+
+            if (targetBlock.getType() == Material.AIR) {
+                targetBlock.setType(Material.LIGHT, false);
+                if (targetBlock.getBlockData() instanceof Levelled levelled) {
+                    levelled.setLevel(15);
+                    targetBlock.setBlockData(levelled, false);
+                }
+                activeLightBlocks.put(cart.getUniqueId(), targetBlock);
+            }
+        }
     }
 
     private void driveMinecart(Player player, Minecart cart) {
@@ -153,15 +259,15 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         cart.setRotation(yaw, 0f);
 
         Vector forward = player.getEyeLocation().getDirection().setY(0).normalize();
-        double speed = 0.0;
+        updateHeadlights(cart, forward);
 
+        double speed = 0.0;
         if (input.isForward()) {
             speed = MAX_SPEED;
         } else if (input.isBackward()) {
             speed = -MAX_SPEED * 0.5;
         }
 
-        // Клаксон (гудок) по нажатию Пробела
         if (input.isJump() && tickCounter % 8 == 0) {
             cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 1.0f, 0.55f);
             cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 1.0f, 0.75f);
@@ -171,7 +277,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         boolean onGround = hasGroundTraction(cart);
 
         if (speed != 0.0) {
-            // Выхлопной дым работает всегда при нажатии газа
             Location exhaust = cart.getLocation().subtract(forward.clone().multiply(0.7)).add(0, 0.25, 0);
             cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.08, 0.05, 0.08, 0.01);
             if (tickCounter % 3 == 0) {
@@ -179,19 +284,12 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
 
             if (onGround) {
-                // Колеса на земле: разгоняем машину и заезжаем на блоки высотой 1 метр
+                Vector moveDir = speed > 0 ? forward.clone() : forward.clone().multiply(-1);
                 Vector move = forward.clone().multiply(speed);
                 double yVel = velocity.getY();
 
-                Vector checkDir = speed > 0 ? forward.clone() : forward.clone().multiply(-1);
-                Location frontLoc = cart.getLocation().add(checkDir.multiply(0.85));
-                Block frontBlock = frontLoc.getBlock();
-                Block aboveFront = frontBlock.getRelative(0, 1, 0);
-
-                if (frontBlock.getType().isSolid() && !aboveFront.getType().isSolid()) {
-                    Location stepUp = cart.getLocation().add(0, 0.55, 0);
-                    cart.teleport(stepUp);
-                    yVel = 0.15;
+                if (canStepUp(cart, moveDir)) {
+                    yVel = 0.48;
                 }
 
                 cart.setVelocity(new Vector(move.getX(), yVel, move.getZ()));
@@ -200,20 +298,16 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                     cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, 0.45f);
                 }
             } else {
-                // Машина в воздухе: колесам не от чего отталкиваться, сохраняем только текущую инерцию полета
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
 
-                // В воздухе мотор крутит колеса вхолостую на повышенных оборотах
                 if (tickCounter % 3 == 0) {
                     cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.4f, 0.85f);
                 }
             }
         } else {
             if (onGround) {
-                // На земле без газа плавно тормозим
                 cart.setVelocity(new Vector(velocity.getX() * 0.8, velocity.getY(), velocity.getZ() * 0.8));
             } else {
-                // В воздухе без газа летим по инерции
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
             }
 
