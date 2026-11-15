@@ -100,6 +100,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, List<BlockDisplay>> carModels = new HashMap<>();
     private final Map<UUID, Interaction> carHitboxes = new HashMap<>();
     private final Map<UUID, Long> interactionDebounce = new HashMap<>();
+    private final Map<UUID, Float> smoothedYaw = new HashMap<>();
 
     private static class FuelTankHolder implements InventoryHolder {
         private final UUID carId;
@@ -161,7 +162,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         Bukkit.getPluginManager().registerEvents(this, this);
         registerCarRecipe();
 
-        // Очищаем старые детали модели и хитбоксы, подхватываем машины
         for (World world : Bukkit.getWorlds()) {
             for (BlockDisplay bd : world.getEntitiesByClass(BlockDisplay.class)) {
                 if (bd.getPersistentDataContainer().has(carPartKey, PersistentDataType.STRING)) {
@@ -194,6 +194,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                     removeCarModel(id);
                     removeCarHitbox(id);
                     stepCooldowns.remove(id);
+                    smoothedYaw.remove(id);
                     it.remove();
                     continue;
                 }
@@ -237,9 +238,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         trackedCars.clear();
         stepCooldowns.clear();
+        smoothedYaw.clear();
     }
 
-    // ==================== ХИТБОКС ВЗАИМОДЕЙСТВИЯ (INTERACTION ENTITY) ====================
+    // ==================== ХИТБОКС ВЗАИМОДЕЙСТВИЯ ====================
 
     private void spawnCarHitbox(Minecart cart) {
         removeCarHitbox(cart.getUniqueId());
@@ -257,7 +259,14 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             spawnCarHitbox(cart);
             return;
         }
-        hitbox.teleport(cart.getLocation());
+        // Перемещаем хитбокс только когда в машине нет водителя, чтобы избежать лишних пакетов при быстрой езде
+        if (getDriver(cart) == null) {
+            if (hitbox.getLocation().distanceSquared(cart.getLocation()) > 0.01) {
+                hitbox.teleport(cart.getLocation());
+            }
+        } else if (tickCounter % 5 == 0) {
+            hitbox.teleport(cart.getLocation());
+        }
     }
 
     private void removeCarHitbox(UUID carId) {
@@ -299,10 +308,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return false;
     }
 
-    // ==================== 3D-МОДЕЛЬ АВТОМОБИЛЯ (PASSENGER MOUNT) ====================
-    // Детали BlockDisplay посажены ПАССАЖИРАМИ на вагонетку (cart.addPassenger(display))!
-    // Клиент Minecraft сам синхронизирует позицию пассажиров с позицией вагонетки в каждом кадре,
-    // поэтому кузов НИКОГДА не отстает и не уезжает вперед от вагонетки даже на высокой скорости.
+    // ==================== 3D-МОДЕЛЬ АВТОМОБИЛЯ ====================
 
     private BlockDisplay createModelPart(Minecart cart, Material mat,
                                          float tx, float ty, float tz,
@@ -321,13 +327,13 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 new AxisAngle4f(0, 0, 1, 0)
         ));
         display.setTeleportDuration(0);
-        display.setInterpolationDuration(0);
+        // Плавная 1-тиковая интерполяция поворота устраняет рывки кузова при вращении камеры
+        display.setInterpolationDuration(1);
         display.setBrightness(new Display.Brightness(15, 15));
         display.getPersistentDataContainer().set(carPartKey, PersistentDataType.STRING, carId.toString());
         if (partType != null) {
             display.getPersistentDataContainer().set(partTypeKey, PersistentDataType.STRING, partType);
         }
-        // Сажаем деталь пассажиром на вагонетку — клиент сам жестко держит ее в центре вагонетки!
         cart.addPassenger(display);
         return display;
     }
@@ -336,41 +342,26 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         removeCarModel(cart.getUniqueId());
         List<BlockDisplay> parts = new ArrayList<>();
 
-        // 1. Широкое шасси / днище (опущено до y = -0.35 от точки крепления пассажира, полностью прячет вагонетку)
         parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
                 -0.78f, -0.34f, -1.25f, 1.56f, 0.28f, 2.50f, "chassis"));
-
-        // 2. Нижний основной кузов (от y = -0.06 до y = +0.52, полностью закрывает борта вагонетки)
         parts.add(createModelPart(cart, Material.RED_CONCRETE,
                 -0.80f, -0.06f, -1.30f, 1.60f, 0.58f, 2.60f, "body"));
-
-        // 3. Капот (спереди, +Z: от z = +0.52 до z = +1.28)
         parts.add(createModelPart(cart, Material.RED_CONCRETE,
                 -0.76f, 0.52f, 0.52f, 1.52f, 0.14f, 0.76f, "hood"));
-
-        // 4. Багажник (сзади, -Z: от z = -1.28 до z = -0.68)
         parts.add(createModelPart(cart, Material.RED_CONCRETE,
                 -0.76f, 0.52f, -1.28f, 1.52f, 0.16f, 0.60f, "trunk"));
-
-        // 5. Высокая крыша салона (ровно над водителем: от z = -0.68 до z = +0.54, высота y = 1.48..1.62)
         parts.add(createModelPart(cart, Material.RED_CONCRETE,
                 -0.72f, 1.48f, -0.68f, 1.44f, 0.14f, 1.22f, "roof"));
 
-        // 6. Лобовое стекло (спереди кабины, z = +0.50)
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
                 -0.68f, 0.52f, 0.50f, 1.36f, 0.96f, 0.06f, "windshield"));
-
-        // 7. Заднее стекло (позади водителя, z = -0.66)
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
                 -0.68f, 0.52f, -0.66f, 1.36f, 0.96f, 0.06f, "rear_glass"));
-
-        // 8. Боковые стекла (левое и правое вокруг водителя)
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
                 -0.72f, 0.52f, -0.60f, 0.06f, 0.96f, 1.10f, "side_glass_l"));
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
                 0.66f, 0.52f, -0.60f, 0.06f, 0.96f, 1.10f, "side_glass_r"));
 
-        // 9. Стойки крыши (4 черные стойки по углам кабины)
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
                 -0.73f, 0.52f, 0.44f, 0.11f, 0.96f, 0.11f, "pillar_fl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
@@ -380,30 +371,24 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
                 0.62f, 0.52f, -0.68f, 0.11f, 0.96f, 0.11f, "pillar_rr"));
 
-        // 10. Передний (+Z) и задний (-Z) бамперы
         parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
                 -0.82f, -0.18f, 1.24f, 1.64f, 0.24f, 0.14f, "bumper_f"));
         parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
                 -0.82f, -0.18f, -1.38f, 1.64f, 0.24f, 0.14f, "bumper_r"));
-
-        // 11. Решетка радиатора спереди (+Z)
         parts.add(createModelPart(cart, Material.POLISHED_ANDESITE,
                 -0.42f, 0.12f, 1.28f, 0.84f, 0.28f, 0.06f, "grille"));
 
-        // 12. Фары спереди (+Z)
         Material hlMat = areHeadlightsOn(cart) ? Material.SEA_LANTERN : Material.WHITE_STAINED_GLASS;
         parts.add(createModelPart(cart, hlMat,
                 -0.68f, 0.20f, 1.28f, 0.24f, 0.18f, 0.06f, "headlight_l"));
         parts.add(createModelPart(cart, hlMat,
                 0.44f, 0.20f, 1.28f, 0.24f, 0.18f, 0.06f, "headlight_r"));
 
-        // 13. Задние стоп-сигналы сзади (-Z)
         parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
                 -0.68f, 0.22f, -1.34f, 0.26f, 0.16f, 0.05f, "taillight_l"));
         parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
                 0.42f, 0.22f, -1.34f, 0.26f, 0.16f, 0.05f, "taillight_r"));
 
-        // 14. Четыре колеса (касаются земли на уровне y = -0.35)
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
                 -0.90f, -0.35f, 0.62f, 0.18f, 0.52f, 0.52f, "wheel_fl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
@@ -413,7 +398,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
                 0.72f, -0.35f, -1.06f, 0.18f, 0.52f, 0.52f, "wheel_rr"));
 
-        // 15. Диски колес
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
                 -0.92f, -0.21f, 0.76f, 0.04f, 0.24f, 0.24f, "hub_fl"));
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
@@ -423,33 +407,32 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
                 0.88f, -0.21f, -0.92f, 0.04f, 0.24f, 0.24f, "hub_rr"));
 
-        // 16. Выхлопная труба сзади (-Z)
         parts.add(createModelPart(cart, Material.NETHERITE_BLOCK,
                 0.42f, -0.20f, -1.46f, 0.14f, 0.14f, 0.20f, "exhaust"));
 
         carModels.put(cart.getUniqueId(), parts);
     }
 
-    private void updateCarModel(Minecart cart) {
+    private void updateCarModel(Minecart cart, float yaw) {
         List<BlockDisplay> parts = carModels.get(cart.getUniqueId());
         if (parts == null || parts.isEmpty()) {
             spawnCarModel(cart);
             return;
         }
 
-        float yaw = cart.getLocation().getYaw();
         boolean anyInvalid = false;
         for (BlockDisplay bd : parts) {
             if (bd == null || !bd.isValid()) {
                 anyInvalid = true;
                 break;
             }
-            // Если деталь по какой-то причине отцепилась от вагонетки — возвращаем ее в пассажиры
             if (!cart.getPassengers().contains(bd)) {
                 cart.addPassenger(bd);
             }
-            // Обновляем только угол поворота (yaw), позицию держит сам движок игры без лагов!
-            bd.setRotation(yaw, 0f);
+            // Отправляем пакет поворота только при реальном изменении угла, чтобы не перегружать клиент
+            if (Math.abs(bd.getLocation().getYaw() - yaw) > 0.15f) {
+                bd.setRotation(yaw, 0f);
+            }
         }
 
         if (anyInvalid) {
@@ -727,6 +710,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         openTrunks.remove(cart.getUniqueId());
 
         stepCooldowns.remove(cart.getUniqueId());
+        smoothedYaw.remove(cart.getUniqueId());
         trackedCars.remove(cart.getUniqueId());
 
         cart.remove();
@@ -997,6 +981,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     public void onEnter(VehicleEnterEvent event) {
         if (event.getVehicle() instanceof Minecart cart && isCar(cart) && event.getEntered() instanceof Player player) {
             trackedCars.add(cart.getUniqueId());
+            smoothedYaw.put(cart.getUniqueId(), player.getEyeLocation().getYaw());
             cart.setCustomNameVisible(false);
             cart.setSilent(true);
             cart.setDerailedVelocityMod(new Vector(0.95, 0.95, 0.95));
@@ -1107,9 +1092,18 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return false;
     }
 
-    private Vector getCarForwardVector(Minecart cart) {
-        double yawRad = Math.toRadians(cart.getLocation().getYaw());
+    private Vector getCarForwardVector(float yaw) {
+        double yawRad = Math.toRadians(yaw);
         return new Vector(-Math.sin(yawRad), 0, Math.cos(yawRad)).normalize();
+    }
+
+    // Плавная интерполяция угла поворота (рулевое сглаживание без резких рывков камеры)
+    private float smoothYaw(UUID carId, float targetYaw, float factor) {
+        float current = smoothedYaw.getOrDefault(carId, targetYaw);
+        float delta = ((targetYaw - current + 540f) % 360f) - 180f;
+        float next = current + delta * factor;
+        smoothedYaw.put(carId, next);
+        return next;
     }
 
     private void updateHeadlights(Minecart cart, Vector forward) {
@@ -1173,14 +1167,17 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private void tickCar(Minecart cart) {
         Player driver = getDriver(cart);
 
-        Vector forward;
+        float carYaw;
         if (driver != null) {
-            float yaw = driver.getEyeLocation().getYaw();
-            cart.setRotation(yaw, 0f);
-            forward = driver.getEyeLocation().getDirection().setY(0).normalize();
+            // Плавный поворот руля за взглядом водителя (коэффициент 0.35 убирает микро-рывки)
+            carYaw = smoothYaw(cart.getUniqueId(), driver.getEyeLocation().getYaw(), 0.35f);
+            if (Math.abs(cart.getLocation().getYaw() - carYaw) > 0.2f) {
+                cart.setRotation(carYaw, 0f);
+            }
         } else {
-            forward = getCarForwardVector(cart);
+            carYaw = smoothedYaw.getOrDefault(cart.getUniqueId(), cart.getLocation().getYaw());
         }
+        Vector forward = getCarForwardVector(carYaw);
 
         if (driver != null) {
             var input = driver.getCurrentInput();
@@ -1209,11 +1206,11 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         if (!isEngineOn(cart)) {
             if (onGround) {
-                cart.setVelocity(new Vector(velocity.getX() * 0.8, velocity.getY(), velocity.getZ() * 0.8));
+                cart.setVelocity(new Vector(velocity.getX() * 0.85, velocity.getY(), velocity.getZ() * 0.85));
             } else {
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
             }
-            updateCarModel(cart);
+            updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
             updateHeadlights(cart, forward);
             return;
@@ -1225,7 +1222,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             if (driver != null) {
                 driver.sendActionBar(Component.text("§cТопливо закончилось! Двигатель заглох (Shift+ПКМ — заправить уголь)"));
             }
-            updateCarModel(cart);
+            updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
             updateHeadlights(cart, forward);
             return;
@@ -1236,14 +1233,14 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 setFuelTicks(cart, getFuelTicks(cart) - 1);
             }
             if (onGround) {
-                cart.setVelocity(new Vector(velocity.getX() * 0.8, velocity.getY(), velocity.getZ() * 0.8));
+                cart.setVelocity(new Vector(velocity.getX() * 0.85, velocity.getY(), velocity.getZ() * 0.85));
             }
             if (tickCounter % 8 == 0) {
                 Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
                 cart.getWorld().spawnParticle(Particle.SMOKE, exhaust, 1, 0.05, 0.05, 0.05, 0.01);
                 cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.15f, 0.35f);
             }
-            updateCarModel(cart);
+            updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
             updateHeadlights(cart, forward);
             return;
@@ -1251,10 +1248,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         var input = driver.getCurrentInput();
         int currentGear = getGear(cart);
-        double speed = 0.0;
+        double targetSpeed = 0.0;
 
         if (input.isForward() && !input.isBackward()) {
-            speed = getGearSpeed(currentGear);
+            targetSpeed = getGearSpeed(currentGear);
         }
 
         int burnRate = input.isForward() ? 2 : 1;
@@ -1266,7 +1263,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             driver.sendActionBar(Component.text("§7КПП: " + formatGearShort(currentGear) + " §7| Топливо: " + color + secLeft + "с §7| Ctrl+1/2/3/4/Q"));
         }
 
-        if (speed != 0.0) {
+        if (targetSpeed != 0.0) {
             Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
             cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.08, 0.05, 0.08, 0.01);
             if (tickCounter % 3 == 0) {
@@ -1274,11 +1271,14 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
 
             if (onGround) {
-                Vector moveDir = speed > 0 ? forward.clone() : forward.clone().multiply(-1);
+                Vector moveDir = targetSpeed > 0 ? forward.clone() : forward.clone().multiply(-1);
 
-                if (!tryStepUp(cart, moveDir, speed)) {
-                    Vector move = forward.clone().multiply(speed);
-                    cart.setVelocity(new Vector(move.getX(), velocity.getY(), move.getZ()));
+                if (!tryStepUp(cart, moveDir, targetSpeed)) {
+                    // Плавное ускорение и руление (интерполяция скорости вместо мгновенного скачка)
+                    Vector targetVel = forward.clone().multiply(targetSpeed);
+                    double smoothX = velocity.getX() + (targetVel.getX() - velocity.getX()) * 0.25;
+                    double smoothZ = velocity.getZ() + (targetVel.getZ() - velocity.getZ()) * 0.25;
+                    cart.setVelocity(new Vector(smoothX, velocity.getY(), smoothZ));
                 }
 
                 if (tickCounter % 3 == 0) {
@@ -1292,7 +1292,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 }
             }
         } else {
-            double drag = input.isBackward() ? 0.55 : 0.85;
+            // Плавный накат (0.92) при отпускании газа и уверенное торможение (0.65) при нажатии S
+            double drag = input.isBackward() ? 0.65 : 0.92;
             if (onGround) {
                 cart.setVelocity(new Vector(velocity.getX() * drag, velocity.getY(), velocity.getZ() * drag));
             } else {
@@ -1312,7 +1313,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        updateCarModel(cart);
+        updateCarModel(cart, carYaw);
         updateCarHitbox(cart);
         updateHeadlights(cart, forward);
     }
