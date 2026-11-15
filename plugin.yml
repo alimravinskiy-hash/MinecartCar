@@ -1,0 +1,4 @@
+name: MinecartCar
+version: 1.0
+main: com.example.minecartcar.MinecartCarPlugin
+api-version: '1.21'
