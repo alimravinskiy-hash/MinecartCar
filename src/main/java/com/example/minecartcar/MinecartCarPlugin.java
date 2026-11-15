@@ -23,8 +23,10 @@ import org.bukkit.event.block.Action;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.event.vehicle.VehicleDestroyEvent;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
@@ -54,24 +56,29 @@ import java.util.UUID;
 
 public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
-    private static final double MAX_SPEED = 0.70;
-    // 1 обычный или древесный уголь дает 1200 тиков (60 секунд) работы двигателя
     private static final int TICKS_PER_COAL = 1200;
-    // 1 угольный блок дает 10800 тиков (9 минут) работы двигателя
     private static final int TICKS_PER_COAL_BLOCK = 10800;
+
+    // Передачи: -1 = R (Задняя), 0 = N (Нейтраль), 1 = 1-я, 2 = 2-я, 3 = 3-я
+    private static final int GEAR_REVERSE = -1;
+    private static final int GEAR_NEUTRAL = 0;
+    private static final int GEAR_FIRST = 1;
+    private static final int GEAR_SECOND = 2;
+    private static final int GEAR_THIRD = 3;
 
     private NamespacedKey carKey;
     private NamespacedKey headlightsKey;
     private NamespacedKey engineKey;
     private NamespacedKey fuelTicksKey;
     private NamespacedKey tankDataKey;
+    private NamespacedKey gearKey;
     private int tickCounter = 0;
 
     private final Set<UUID> trackedCars = new HashSet<>();
     private final Map<UUID, List<Block>> activeLightBlocks = new HashMap<>();
     private final Map<UUID, Inventory> openTanks = new HashMap<>();
+    private final Map<UUID, Integer> stepCooldowns = new HashMap<>();
 
-    // Специальный держатель инвентаря, чтобы отличать топливный бак машины от обычных сундуков
     private static class FuelTankHolder implements InventoryHolder {
         private final UUID carId;
         private Inventory inventory;
@@ -101,6 +108,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         engineKey = new NamespacedKey(this, "engine_on");
         fuelTicksKey = new NamespacedKey(this, "fuel_ticks");
         tankDataKey = new NamespacedKey(this, "fuel_tank_items");
+        gearKey = new NamespacedKey(this, "current_gear");
 
         Bukkit.getPluginManager().registerEvents(this, this);
         registerCarRecipe();
@@ -121,6 +129,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 Entity entity = Bukkit.getEntity(id);
                 if (!(entity instanceof Minecart cart) || !cart.isValid()) {
                     clearLights(id);
+                    stepCooldowns.remove(id);
                     it.remove();
                     continue;
                 }
@@ -144,6 +153,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
         activeLightBlocks.clear();
         trackedCars.clear();
+        stepCooldowns.clear();
     }
 
     private ItemStack createCarItem() {
@@ -152,9 +162,9 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         if (meta != null) {
             meta.displayName(Component.text("§6§lАвтомобиль"));
             meta.lore(List.of(
-                    Component.text("§7Поставьте на землю (ПКМ)"),
-                    Component.text("§eShift + ПКМ по машине — открыть топливный бак"),
-                    Component.text("§eПробел — завести | F — фары | W/S — газ/тормоз")
+                    Component.text("§7Поставьте на землю (ПКМ) | Shift+ПКМ — бак"),
+                    Component.text("§eПробел — завести | F — фары | W — газ | S — тормоз"),
+                    Component.text("§eКПП: Ctrl + 1/2/3 (передачи), Ctrl + 4 (N), Ctrl + Q (R)")
             ));
             meta.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, (byte) 1);
             item.setItemMeta(meta);
@@ -193,6 +203,55 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         cart.getPersistentDataContainer().set(engineKey, PersistentDataType.BYTE, state ? (byte) 1 : (byte) 0);
     }
 
+    private int getGear(Minecart cart) {
+        return cart.getPersistentDataContainer().getOrDefault(gearKey, PersistentDataType.INTEGER, GEAR_NEUTRAL);
+    }
+
+    private void setGear(Minecart cart, int gear) {
+        int clamped = Math.max(GEAR_REVERSE, Math.min(GEAR_THIRD, gear));
+        cart.getPersistentDataContainer().set(gearKey, PersistentDataType.INTEGER, clamped);
+    }
+
+    private String formatGearName(int gear) {
+        return switch (gear) {
+            case GEAR_REVERSE -> "§c[R] Задняя";
+            case GEAR_FIRST -> "§a[1] Первая";
+            case GEAR_SECOND -> "§e[2] Вторая";
+            case GEAR_THIRD -> "§6[3] Третья";
+            default -> "§7[N] Нейтраль";
+        };
+    }
+
+    private String formatGearShort(int gear) {
+        return switch (gear) {
+            case GEAR_REVERSE -> "§c[R]";
+            case GEAR_FIRST -> "§a[1]";
+            case GEAR_SECOND -> "§e[2]";
+            case GEAR_THIRD -> "§6[3]";
+            default -> "§7[N]";
+        };
+    }
+
+    private double getGearSpeed(int gear) {
+        return switch (gear) {
+            case GEAR_REVERSE -> -0.35;
+            case GEAR_FIRST -> 0.42;
+            case GEAR_SECOND -> 0.72;
+            case GEAR_THIRD -> 1.05;
+            default -> 0.0;
+        };
+    }
+
+    private float getGearPitch(int gear) {
+        return switch (gear) {
+            case GEAR_REVERSE -> 0.40f;
+            case GEAR_FIRST -> 0.50f;
+            case GEAR_SECOND -> 0.70f;
+            case GEAR_THIRD -> 0.95f;
+            default -> 0.35f;
+        };
+    }
+
     private int getFuelTicks(Minecart cart) {
         return cart.getPersistentDataContainer().getOrDefault(fuelTicksKey, PersistentDataType.INTEGER, 0);
     }
@@ -207,7 +266,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return type == Material.COAL || type == Material.CHARCOAL || type == Material.COAL_BLOCK;
     }
 
-    // Сохраняем содержимое потайного топливного бака в данные самой машины
     private void saveTank(Minecart cart, Inventory inv) {
         try {
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
@@ -250,7 +308,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return openTanks.computeIfAbsent(cart.getUniqueId(), id -> loadTank(cart));
     }
 
-    // Попытка взять 1 единицу угля из бака, если текущий заряд закончился
     private boolean consumeFuelIfNeeded(Minecart cart) {
         int currentTicks = getFuelTicks(cart);
         if (currentTicks > 0) {
@@ -276,7 +333,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return false;
     }
 
-    // Подсчет общего запаса топлива в секундах (текущий уголь + весь запас в баке)
     private int getTotalFuelSeconds(Minecart cart) {
         int totalTicks = getFuelTicks(cart);
         Inventory inv = getOrOpenTank(cart);
@@ -301,7 +357,53 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // Открытие потайного топливного бака по Shift + ПКМ по машине
+    // Проверяем, зажата ли клавиша Ctrl (спринт) у водителя
+    private boolean isCtrlHeld(Player player) {
+        return player.getCurrentInput().isSprint() || player.isSprinting();
+    }
+
+    // Переключение передач через Ctrl + 1, Ctrl + 2, Ctrl + 3, Ctrl + 4 (N)
+    @EventHandler
+    public void onCtrlGearSlotChange(PlayerItemHeldEvent event) {
+        Player player = event.getPlayer();
+        if (!(player.getVehicle() instanceof Minecart cart) || !isCar(cart)) return;
+
+        if (!isCtrlHeld(player)) return;
+
+        int slot = event.getNewSlot();
+        int newGear = switch (slot) {
+            case 0 -> GEAR_FIRST;   // Ctrl + 1 -> 1-я передача
+            case 1 -> GEAR_SECOND;  // Ctrl + 2 -> 2-я передача
+            case 2 -> GEAR_THIRD;   // Ctrl + 3 -> 3-я передача
+            case 3 -> GEAR_NEUTRAL; // Ctrl + 4 -> Нейтраль [N]
+            default -> -99;
+        };
+
+        if (newGear != -99) {
+            event.setCancelled(true);
+            if (newGear != getGear(cart)) {
+                setGear(cart, newGear);
+                cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_TRIPWIRE_CLICK_ON, 0.8f, 1.3f);
+                player.sendActionBar(Component.text("§7Передача: " + formatGearName(newGear)));
+            }
+        }
+    }
+
+    // Включение задней передачи [R] через Ctrl + Q
+    @EventHandler
+    public void onCtrlReverseDrop(PlayerDropItemEvent event) {
+        Player player = event.getPlayer();
+        if (!(player.getVehicle() instanceof Minecart cart) || !isCar(cart)) return;
+
+        if (isCtrlHeld(player)) {
+            event.setCancelled(true);
+            int newGear = (getGear(cart) == GEAR_REVERSE) ? GEAR_NEUTRAL : GEAR_REVERSE;
+            setGear(cart, newGear);
+            cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_TRIPWIRE_CLICK_ON, 0.8f, 0.9f);
+            player.sendActionBar(Component.text("§7Передача: " + formatGearName(newGear)));
+        }
+    }
+
     @EventHandler
     public void onOpenTank(PlayerInteractEntityEvent event) {
         if (event.getHand() != EquipmentSlot.HAND) return;
@@ -316,10 +418,9 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // Разрешаем класть в топливный бак только уголь, древесный уголь и угольные блоки
     @EventHandler
     public void onTankClick(InventoryClickEvent event) {
-        if (!(event.getInventory().getHolder() instanceof FuelTankHolder holder)) return;
+        if (!(event.getInventory().getHolder() instanceof FuelTankHolder)) return;
 
         if (event.getClickedInventory() == event.getInventory()) {
             ItemStack cursor = event.getCursor();
@@ -368,6 +469,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    // Переключение фар клавишей F (смена руки)
     @EventHandler
     public void onToggleHeadlights(PlayerSwapHandItemsEvent event) {
         Player player = event.getPlayer();
@@ -406,7 +508,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         cart.setCustomNameVisible(false);
         cart.setSilent(true);
         cart.setDerailedVelocityMod(new Vector(0.95, 0.95, 0.95));
-        cart.setMaxSpeed(1.5);
+        cart.setMaxSpeed(1.8);
         trackedCars.add(cart.getUniqueId());
 
         if (event.getPlayer().getGameMode() != GameMode.CREATIVE) {
@@ -420,7 +522,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             event.setCancelled(true);
             clearLights(cart.getUniqueId());
 
-            // Выбрасываем весь оставшийся уголь из бака при поломке машины
             Inventory tank = getOrOpenTank(cart);
             for (ItemStack item : tank.getContents()) {
                 if (item != null && item.getType() != Material.AIR) {
@@ -428,6 +529,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 }
             }
             openTanks.remove(cart.getUniqueId());
+            stepCooldowns.remove(cart.getUniqueId());
             trackedCars.remove(cart.getUniqueId());
 
             cart.remove();
@@ -441,12 +543,13 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             trackedCars.add(cart.getUniqueId());
             cart.setSilent(true);
             cart.setDerailedVelocityMod(new Vector(0.95, 0.95, 0.95));
-            cart.setMaxSpeed(1.5);
+            cart.setMaxSpeed(1.8);
             int fuelSec = getTotalFuelSeconds(cart);
+            String gearStr = formatGearShort(getGear(cart));
             if (isEngineOn(cart)) {
-                player.sendActionBar(Component.text("§aМотор работает §7| §6Топливо: §e" + fuelSec + "с §7| §eShift+ПКМ снаружи — бак"));
+                player.sendActionBar(Component.text("§aМотор ВКЛ §7| КПП: " + gearStr + " §7| §6Топливо: §e" + fuelSec + "с §7| Ctrl+1/2/3/4/Q — передачи"));
             } else {
-                player.sendActionBar(Component.text("§cМотор заглушен §7| §6Топливо: §e" + fuelSec + "с §7| §eПробел — завести"));
+                player.sendActionBar(Component.text("§cМотор ВЫКЛ §7| КПП: " + gearStr + " §7| §eПробел — завести | Ctrl+1/2/3/4/Q — передачи"));
             }
         }
     }
@@ -470,35 +573,64 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return !below.isPassable();
     }
 
-    private boolean canStepUp(Minecart cart, Vector moveDir) {
-        Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.45);
-        Location base = cart.getLocation().add(0, 0.25, 0);
+    private double getBlockTopY(Block block) {
+        if (block.isPassable()) return block.getY();
+        var box = block.getBoundingBox();
+        if (box.getHeight() > 0) {
+            return box.getMaxY();
+        }
+        return block.getY() + 1.0;
+    }
 
-        double[] distances = new double[]{0.75, 1.15};
+    private boolean tryStepUp(Minecart cart, Vector moveDir, double speed) {
+        int cd = stepCooldowns.getOrDefault(cart.getUniqueId(), 0);
+        if (cd > 0) {
+            stepCooldowns.put(cart.getUniqueId(), cd - 1);
+            return false;
+        }
+
+        double currentY = cart.getLocation().getY();
+        Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.45);
+        double[] distances = new double[]{0.65, 0.95, 1.25};
+
+        double targetStepY = -1.0;
+
         for (double dist : distances) {
-            Location center = base.clone().add(moveDir.clone().multiply(dist));
-            Location[] checkPoints = new Location[]{
+            Location center = cart.getLocation().add(moveDir.clone().multiply(dist));
+            Location[] points = new Location[]{
                     center,
                     center.clone().add(side),
                     center.clone().subtract(side)
             };
 
-            for (Location pt : checkPoints) {
-                Block front = pt.getBlock();
-                if (front.isPassable() || front.getType() == Material.DIRT_PATH) {
-                    continue;
-                }
-                if (Tag.FENCES.isTagged(front.getType()) || Tag.WALLS.isTagged(front.getType())) {
-                    continue;
-                }
+            for (Location pt : points) {
+                for (int dy = 0; dy <= 1; dy++) {
+                    Block b = pt.clone().add(0, dy, 0).getBlock();
+                    if (b.isPassable()) continue;
+                    if (Tag.FENCES.isTagged(b.getType()) || Tag.WALLS.isTagged(b.getType())) continue;
 
-                Block above1 = front.getRelative(0, 1, 0);
-                Block above2 = front.getRelative(0, 2, 0);
+                    double topY = getBlockTopY(b);
+                    double diff = topY - currentY;
 
-                if (isPassable(above1) && isPassable(above2)) {
-                    return true;
+                    if (diff > 0.15 && diff <= 1.15) {
+                        Block above1 = b.getRelative(0, 1, 0);
+                        Block above2 = b.getRelative(0, 2, 0);
+                        if (isPassable(above1) && isPassable(above2)) {
+                            if (topY > targetStepY) {
+                                targetStepY = topY;
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        if (targetStepY > currentY) {
+            double boostY = Math.min(0.62, 0.34 + (targetStepY - currentY) * 0.30);
+            Vector stepVel = moveDir.clone().multiply(Math.max(Math.abs(speed), 0.55)).setY(boostY);
+            cart.setVelocity(stepVel);
+            stepCooldowns.put(cart.getUniqueId(), 4);
+            return true;
         }
         return false;
     }
@@ -586,7 +718,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         updateHeadlights(cart, forward);
 
-        // Зажигание по нажатию Пробела
         if (driver != null) {
             var input = driver.getCurrentInput();
             if (input.isJump() && tickCounter % 10 == 0) {
@@ -596,7 +727,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                         setEngineOn(cart, true);
                         cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_PISTON_EXTEND, 0.9f, 0.7f);
                         cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.6f, 0.6f);
-                        driver.sendActionBar(Component.text("§aДвигатель заведен! §6Запас хода: §e" + getTotalFuelSeconds(cart) + "с"));
+                        driver.sendActionBar(Component.text("§aМотор заведен! §7КПП: " + formatGearShort(getGear(cart)) + " §7| §6Топливо: §e" + getTotalFuelSeconds(cart) + "с"));
                     } else {
                         cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_DISPENSER_FAIL, 0.9f, 1.2f);
                         driver.sendActionBar(Component.text("§cНет топлива! §7Встаньте и нажмите §eShift + ПКМ §7по машине, чтобы засыпать уголь"));
@@ -621,7 +752,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // Проверяем наличие топлива в работающем двигателе
         if (!consumeFuelIfNeeded(cart)) {
             setEngineOn(cart, false);
             cart.getWorld().playSound(cart.getLocation(), Sound.BLOCK_FIRE_EXTINGUISH, 0.8f, 0.8f);
@@ -632,7 +762,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
 
         if (driver == null) {
-            // На холостом ходу без водителя топливо тратится в 2 раза медленнее (1 тик раз в 2 тика)
             if (tickCounter % 2 == 0) {
                 setFuelTicks(cart, getFuelTicks(cart) - 1);
             }
@@ -648,22 +777,20 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
 
         var input = driver.getCurrentInput();
+        int currentGear = getGear(cart);
         double speed = 0.0;
-        if (input.isForward()) {
-            speed = MAX_SPEED;
-        } else if (input.isBackward()) {
-            speed = -MAX_SPEED * 0.5;
+
+        if (input.isForward() && !input.isBackward()) {
+            speed = getGearSpeed(currentGear);
         }
 
-        // Расход топлива: при нажатом газе тратится в 2 раза быстрее, чем на холостом ходу
-        int burnRate = (speed != 0.0) ? 2 : 1;
+        int burnRate = input.isForward() ? 2 : 1;
         setFuelTicks(cart, getFuelTicks(cart) - burnRate);
 
-        // Показываем водителю индикатор оставшегося топлива раз в секунду
         if (tickCounter % 20 == 0) {
             int secLeft = getTotalFuelSeconds(cart);
             String color = secLeft > 30 ? "§a" : (secLeft > 10 ? "§e" : "§c");
-            driver.sendActionBar(Component.text("§7Топливо: " + color + secLeft + " сек. §7| §eF — фары | Пробел — заглушить"));
+            driver.sendActionBar(Component.text("§7КПП: " + formatGearShort(currentGear) + " §7| Топливо: " + color + secLeft + "с §7| Ctrl+1/2/3/4/Q"));
         }
 
         if (speed != 0.0) {
@@ -675,33 +802,37 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
             if (onGround) {
                 Vector moveDir = speed > 0 ? forward.clone() : forward.clone().multiply(-1);
-                Vector move = forward.clone().multiply(speed);
-                double yVel = velocity.getY();
 
-                if (canStepUp(cart, moveDir)) {
-                    yVel = 0.56;
+                if (!tryStepUp(cart, moveDir, speed)) {
+                    Vector move = forward.clone().multiply(speed);
+                    cart.setVelocity(new Vector(move.getX(), velocity.getY(), move.getZ()));
                 }
 
-                cart.setVelocity(new Vector(move.getX(), yVel, move.getZ()));
-
                 if (tickCounter % 3 == 0) {
-                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, 0.45f);
+                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, getGearPitch(currentGear));
                 }
             } else {
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
 
                 if (tickCounter % 3 == 0) {
-                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.4f, 0.85f);
+                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.4f, 0.95f);
                 }
             }
         } else {
+            double drag = input.isBackward() ? 0.55 : 0.85;
             if (onGround) {
-                cart.setVelocity(new Vector(velocity.getX() * 0.8, velocity.getY(), velocity.getZ() * 0.8));
+                cart.setVelocity(new Vector(velocity.getX() * drag, velocity.getY(), velocity.getZ() * drag));
             } else {
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
             }
 
-            if (tickCounter % 8 == 0) {
+            if (input.isForward() && currentGear == GEAR_NEUTRAL) {
+                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(0.7)).add(0, 0.25, 0);
+                cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.06, 0.04, 0.06, 0.01);
+                if (tickCounter % 3 == 0) {
+                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, 0.80f);
+                }
+            } else if (tickCounter % 8 == 0) {
                 Location exhaust = cart.getLocation().subtract(forward.clone().multiply(0.7)).add(0, 0.25, 0);
                 cart.getWorld().spawnParticle(Particle.SMOKE, exhaust, 1, 0.05, 0.05, 0.05, 0.01);
                 cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.15f, 0.35f);
