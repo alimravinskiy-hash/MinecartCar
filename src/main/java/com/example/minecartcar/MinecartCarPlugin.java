@@ -80,6 +80,128 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private static final int GEAR_SECOND = 2;
     private static final int GEAR_THIRD = 3;
 
+    // ==================== ТИПЫ ТРАНСПОРТА И ИХ ХАРАКТЕРИСТИКИ ====================
+    // Все цифры для настройки собраны здесь. Старые машины (значение 1 в PDC) остаются CAR.
+
+    private enum CarType {
+        CAR(
+                (byte) 1,                  // id в PersistentDataContainer
+                "car_recipe",              // ключ рецепта
+                "§6§lАвтомобиль",          // название предмета
+                9, 27,                     // слотов: топливный бак, багажник
+                "§8Топливный бак (Уголь)", // заголовок бака
+                "§8Багажник автомобиля",   // заголовок багажника
+                1.65f, 1.75f,              // хитбокс взаимодействия: ширина, высота
+                -0.35, 0.42, 0.72, 1.15,   // скорость: R, 1-я, 2-я, 3-я
+                1.0f,                      // множитель тона звука двигателя
+                2,                         // расход топлива (тиков за тик) при нажатом W
+                0.25,                      // разгон (0..1, чем больше — тем резче)
+                0.92, 0.65,                // накат без газа, торможение на S (множитель скорости за тик)
+                0.35f,                     // отзывчивость руля (0..1, чем меньше — тем неповоротливее)
+                1.15, 0.58, 0.64,          // подъём на блоки: макс. высота, мин. скорость, макс. вертикальный импульс
+                new double[]{0.55, 0.85, 1.15, 1.40}, // дистанции проверки препятствий впереди
+                4.0,                       // делитель урона от падения для водителя
+                1.32, 0.56, 0.65,          // фары (частицы): вынос вперёд, разнос по бокам, высота
+                1.45                       // вынос выхлопа назад
+        ),
+        GAZELLE(
+                (byte) 2,
+                "gazelle_recipe",
+                "§b§lГАЗель",
+                18, 54,
+                "§8Топливный бак ГАЗели (Уголь)",
+                "§8Грузовой отсек ГАЗели",
+                1.95f, 2.25f,
+                -0.28, 0.34, 0.58, 0.90,
+                0.85f,
+                3,
+                0.14,
+                0.95, 0.78,
+                0.20f,
+                1.05, 0.50, 0.60,
+                new double[]{0.60, 0.95, 1.30, 1.60},
+                3.0,
+                1.55, 0.70, 0.68,
+                2.00
+        );
+
+        final byte id;
+        final String recipeKey;
+        final String itemName;
+        final int tankSize;
+        final int trunkSize;
+        final String tankTitle;
+        final String trunkTitle;
+        final float hitboxWidth;
+        final float hitboxHeight;
+        final double speedReverse;
+        final double speed1;
+        final double speed2;
+        final double speed3;
+        final float pitchMul;
+        final int burnForward;
+        final double acceleration;
+        final double coastDrag;
+        final double brakeDrag;
+        final float steering;
+        final double maxStepHeight;
+        final double stepMinSpeed;
+        final double stepBoostCap;
+        final double[] stepDistances;
+        final double fallDamageDivisor;
+        final double headlightFront;
+        final double headlightSide;
+        final double headlightHeight;
+        final double exhaustBack;
+
+        CarType(byte id, String recipeKey, String itemName,
+                int tankSize, int trunkSize, String tankTitle, String trunkTitle,
+                float hitboxWidth, float hitboxHeight,
+                double speedReverse, double speed1, double speed2, double speed3,
+                float pitchMul, int burnForward,
+                double acceleration, double coastDrag, double brakeDrag, float steering,
+                double maxStepHeight, double stepMinSpeed, double stepBoostCap, double[] stepDistances,
+                double fallDamageDivisor,
+                double headlightFront, double headlightSide, double headlightHeight,
+                double exhaustBack) {
+            this.id = id;
+            this.recipeKey = recipeKey;
+            this.itemName = itemName;
+            this.tankSize = tankSize;
+            this.trunkSize = trunkSize;
+            this.tankTitle = tankTitle;
+            this.trunkTitle = trunkTitle;
+            this.hitboxWidth = hitboxWidth;
+            this.hitboxHeight = hitboxHeight;
+            this.speedReverse = speedReverse;
+            this.speed1 = speed1;
+            this.speed2 = speed2;
+            this.speed3 = speed3;
+            this.pitchMul = pitchMul;
+            this.burnForward = burnForward;
+            this.acceleration = acceleration;
+            this.coastDrag = coastDrag;
+            this.brakeDrag = brakeDrag;
+            this.steering = steering;
+            this.maxStepHeight = maxStepHeight;
+            this.stepMinSpeed = stepMinSpeed;
+            this.stepBoostCap = stepBoostCap;
+            this.stepDistances = stepDistances;
+            this.fallDamageDivisor = fallDamageDivisor;
+            this.headlightFront = headlightFront;
+            this.headlightSide = headlightSide;
+            this.headlightHeight = headlightHeight;
+            this.exhaustBack = exhaustBack;
+        }
+
+        static CarType fromId(byte id) {
+            for (CarType t : values()) {
+                if (t.id == id) return t;
+            }
+            return CAR;
+        }
+    }
+
     private NamespacedKey carKey;
     private NamespacedKey carPartKey;
     private NamespacedKey partTypeKey;
@@ -160,7 +282,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         gearKey = new NamespacedKey(this, "current_gear");
 
         Bukkit.getPluginManager().registerEvents(this, this);
-        registerCarRecipe();
+        registerCarRecipes();
 
         for (World world : Bukkit.getWorlds()) {
             for (BlockDisplay bd : world.getEntitiesByClass(BlockDisplay.class)) {
@@ -245,9 +367,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
     private void spawnCarHitbox(Minecart cart) {
         removeCarHitbox(cart.getUniqueId());
+        CarType type = getCarType(cart);
         Interaction hitbox = (Interaction) cart.getWorld().spawnEntity(cart.getLocation(), EntityType.INTERACTION);
-        hitbox.setInteractionWidth(1.65f);
-        hitbox.setInteractionHeight(1.75f);
+        hitbox.setInteractionWidth(type.hitboxWidth);
+        hitbox.setInteractionHeight(type.hitboxHeight);
         hitbox.setResponsive(true);
         hitbox.getPersistentDataContainer().set(hitboxKey, PersistentDataType.STRING, cart.getUniqueId().toString());
         carHitboxes.put(cart.getUniqueId(), hitbox);
@@ -308,7 +431,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return false;
     }
 
-    // ==================== 3D-МОДЕЛЬ АВТОМОБИЛЯ ====================
+    // ==================== 3D-МОДЕЛЬ ТРАНСПОРТА ====================
 
     private BlockDisplay createModelPart(Minecart cart, Material mat,
                                          float tx, float ty, float tz,
@@ -342,6 +465,17 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         removeCarModel(cart.getUniqueId());
         List<BlockDisplay> parts = new ArrayList<>();
 
+        switch (getCarType(cart)) {
+            case GAZELLE -> buildGazelleModel(cart, parts);
+            default -> buildCarModel(cart, parts);
+        }
+
+        carModels.put(cart.getUniqueId(), parts);
+    }
+
+    // ---------- Легковой автомобиль (без изменений) ----------
+
+    private void buildCarModel(Minecart cart, List<BlockDisplay> parts) {
         parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
                 -0.78f, -0.34f, -1.25f, 1.56f, 0.28f, 2.50f, "chassis"));
         parts.add(createModelPart(cart, Material.RED_CONCRETE,
@@ -409,8 +543,105 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         parts.add(createModelPart(cart, Material.NETHERITE_BLOCK,
                 0.42f, -0.20f, -1.46f, 0.14f, 0.14f, 0.20f, "exhaust"));
+    }
 
-        carModels.put(cart.getUniqueId(), parts);
+    // ---------- ГАЗель: белый фургон с синей полосой ----------
+    // Ось Z: вперёд = +Z. Кабина (водитель в точке 0,0) занимает Z -0.55..0.64,
+    // капот до Z 1.50, грузовой фургон позади кабины Z -1.76..-0.55.
+    // Высота кабины такая же, как у легковушки, а грузовой отсек выше (до Y 2.10).
+
+    private void buildGazelleModel(Minecart cart, List<BlockDisplay> parts) {
+        // Рама, кузов, капот, крыша кабины и высокий грузовой отсек
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                -0.84f, -0.34f, -1.70f, 1.68f, 0.28f, 3.16f, "chassis"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -0.90f, -0.06f, -1.75f, 1.80f, 0.58f, 3.25f, "body"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -0.86f, 0.52f, 0.64f, 1.72f, 0.14f, 0.82f, "hood"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -0.88f, 1.48f, -0.55f, 1.76f, 0.14f, 1.21f, "roof"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -0.91f, 0.52f, -1.76f, 1.82f, 1.58f, 1.21f, "cargo_box"));
+
+        // Стёкла
+        parts.add(createModelPart(cart, Material.TINTED_GLASS,
+                -0.80f, 0.52f, 0.58f, 1.60f, 0.96f, 0.06f, "windshield"));
+        parts.add(createModelPart(cart, Material.TINTED_GLASS,
+                -0.86f, 0.52f, -0.55f, 0.06f, 0.96f, 1.11f, "side_glass_l"));
+        parts.add(createModelPart(cart, Material.TINTED_GLASS,
+                0.80f, 0.52f, -0.55f, 0.06f, 0.96f, 1.11f, "side_glass_r"));
+        parts.add(createModelPart(cart, Material.TINTED_GLASS,
+                -0.70f, 1.30f, -1.795f, 1.40f, 0.55f, 0.035f, "rear_window"));
+
+        // Стойки кабины
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -0.89f, 0.52f, 0.53f, 0.11f, 0.96f, 0.12f, "pillar_fl"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                0.78f, 0.52f, 0.53f, 0.11f, 0.96f, 0.12f, "pillar_fr"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -0.89f, 0.52f, -0.55f, 0.11f, 0.96f, 0.12f, "pillar_rl"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                0.78f, 0.52f, -0.55f, 0.11f, 0.96f, 0.12f, "pillar_rr"));
+
+        // Бамперы и решётка
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                -0.94f, -0.18f, 1.46f, 1.88f, 0.26f, 0.14f, "bumper_f"));
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                -0.94f, -0.18f, -1.90f, 1.88f, 0.26f, 0.14f, "bumper_r"));
+        parts.add(createModelPart(cart, Material.POLISHED_ANDESITE,
+                -0.50f, 0.10f, 1.48f, 1.00f, 0.30f, 0.06f, "grille"));
+
+        // Фары (имена headlight_l / headlight_r нужны для переключения света на F)
+        Material hlMat = areHeadlightsOn(cart) ? Material.SEA_LANTERN : Material.WHITE_STAINED_GLASS;
+        parts.add(createModelPart(cart, hlMat,
+                -0.84f, 0.22f, 1.48f, 0.24f, 0.20f, 0.06f, "headlight_l"));
+        parts.add(createModelPart(cart, hlMat,
+                0.60f, 0.22f, 1.48f, 0.24f, 0.20f, 0.06f, "headlight_r"));
+
+        // Задние фонари
+        parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
+                -0.86f, 0.28f, -1.81f, 0.18f, 0.34f, 0.05f, "taillight_l"));
+        parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
+                0.68f, 0.28f, -1.81f, 0.18f, 0.34f, 0.05f, "taillight_r"));
+
+        // Колёса (крупнее, чем у легковушки) и диски
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -1.02f, -0.35f, 0.66f, 0.22f, 0.58f, 0.58f, "wheel_fl"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                0.80f, -0.35f, 0.66f, 0.22f, 0.58f, 0.58f, "wheel_fr"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -1.02f, -0.35f, -1.44f, 0.22f, 0.58f, 0.58f, "wheel_rl"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                0.80f, -0.35f, -1.44f, 0.22f, 0.58f, 0.58f, "wheel_rr"));
+
+        parts.add(createModelPart(cart, Material.IRON_BLOCK,
+                -1.04f, -0.19f, 0.82f, 0.04f, 0.26f, 0.26f, "hub_fl"));
+        parts.add(createModelPart(cart, Material.IRON_BLOCK,
+                1.00f, -0.19f, 0.82f, 0.04f, 0.26f, 0.26f, "hub_fr"));
+        parts.add(createModelPart(cart, Material.IRON_BLOCK,
+                -1.04f, -0.19f, -1.28f, 0.04f, 0.26f, 0.26f, "hub_rl"));
+        parts.add(createModelPart(cart, Material.IRON_BLOCK,
+                1.00f, -0.19f, -1.28f, 0.04f, 0.26f, 0.26f, "hub_rr"));
+
+        // Выхлопная труба
+        parts.add(createModelPart(cart, Material.NETHERITE_BLOCK,
+                0.55f, -0.22f, -1.96f, 0.16f, 0.16f, 0.22f, "exhaust"));
+
+        // Синяя полоса по бортам фургона
+        parts.add(createModelPart(cart, Material.BLUE_CONCRETE,
+                -0.93f, 0.85f, -1.75f, 0.02f, 0.22f, 1.18f, "stripe_l"));
+        parts.add(createModelPart(cart, Material.BLUE_CONCRETE,
+                0.91f, 0.85f, -1.75f, 0.02f, 0.22f, 1.18f, "stripe_r"));
+
+        // Стык задних дверей
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -0.025f, 0.20f, -1.805f, 0.05f, 1.85f, 0.045f, "rear_door_seam"));
+
+        // Боковые зеркала
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -1.03f, 0.95f, 0.50f, 0.14f, 0.28f, 0.10f, "mirror_l"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                0.89f, 0.95f, 0.50f, 0.14f, 0.28f, 0.10f, "mirror_r"));
     }
 
     private void updateCarModel(Minecart cart, float yaw) {
@@ -465,42 +696,71 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ==================== ПРЕДМЕТ И РЕЦЕПТ ====================
+    // ==================== ПРЕДМЕТЫ И РЕЦЕПТЫ ====================
 
-    private ItemStack createCarItem() {
+    private ItemStack createCarItem(CarType type) {
         ItemStack item = new ItemStack(Material.MINECART);
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
-            meta.displayName(Component.text("§6§lАвтомобиль"));
-            meta.lore(List.of(
-                    Component.text("§7Поставьте на землю (ПКМ) | Сесть: ПКМ"),
-                    Component.text("§eShift + ПКМ снаружи — топливный бак (уголь)"),
-                    Component.text("§eShift + ЛКМ снаружи — багажник (27 слотов)"),
-                    Component.text("§eПробел — завести | F — фары | Ctrl+1/2/3/4/Q — КПП")
-            ));
-            meta.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, (byte) 1);
+            meta.displayName(Component.text(type.itemName));
+
+            List<Component> lore = new ArrayList<>();
+            lore.add(Component.text("§7Поставьте на землю (ПКМ) | Сесть: ПКМ"));
+            lore.add(Component.text("§eShift + ПКМ снаружи — топливный бак (уголь)"));
+            lore.add(Component.text("§eShift + ЛКМ снаружи — багажник (" + type.trunkSize + " слотов)"));
+            lore.add(Component.text("§eПробел — завести | F — фары | Ctrl+1/2/3/4/Q — КПП"));
+            if (type == CarType.GAZELLE) {
+                lore.add(Component.text("§7Грузовой фургон: медленнее легковушки, но вместительнее"));
+            }
+            meta.lore(lore);
+
+            meta.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, type.id);
             item.setItemMeta(meta);
         }
         return item;
     }
 
-    private void registerCarRecipe() {
-        ShapedRecipe recipe = new ShapedRecipe(new NamespacedKey(this, "car_recipe"), createCarItem());
-        recipe.shape(" R ", "ILI", "IFI");
-        recipe.setIngredient('R', Material.REDSTONE);
-        recipe.setIngredient('I', Material.IRON_INGOT);
-        recipe.setIngredient('L', Material.LEATHER);
-        recipe.setIngredient('F', Material.FURNACE);
-        Bukkit.addRecipe(recipe);
+    private void registerCarRecipes() {
+        // Легковой автомобиль (рецепт без изменений)
+        ShapedRecipe carRecipe = new ShapedRecipe(
+                new NamespacedKey(this, CarType.CAR.recipeKey), createCarItem(CarType.CAR));
+        carRecipe.shape(" R ", "ILI", "IFI");
+        carRecipe.setIngredient('R', Material.REDSTONE);
+        carRecipe.setIngredient('I', Material.IRON_INGOT);
+        carRecipe.setIngredient('L', Material.LEATHER);
+        carRecipe.setIngredient('F', Material.FURNACE);
+        Bukkit.addRecipe(carRecipe);
+
+        // ГАЗель: сундук (грузовой отсек) и два железных блока (рама)
+        ShapedRecipe gazelleRecipe = new ShapedRecipe(
+                new NamespacedKey(this, CarType.GAZELLE.recipeKey), createCarItem(CarType.GAZELLE));
+        gazelleRecipe.shape("IRI", "ICI", "BFB");
+        gazelleRecipe.setIngredient('I', Material.IRON_INGOT);
+        gazelleRecipe.setIngredient('R', Material.REDSTONE);
+        gazelleRecipe.setIngredient('C', Material.CHEST);
+        gazelleRecipe.setIngredient('B', Material.IRON_BLOCK);
+        gazelleRecipe.setIngredient('F', Material.FURNACE);
+        Bukkit.addRecipe(gazelleRecipe);
     }
 
     private boolean isCar(Minecart cart) {
         return cart.getPersistentDataContainer().has(carKey, PersistentDataType.BYTE);
     }
 
+    private CarType getCarType(Minecart cart) {
+        Byte id = cart.getPersistentDataContainer().get(carKey, PersistentDataType.BYTE);
+        return id == null ? CarType.CAR : CarType.fromId(id);
+    }
+
+    // Возвращает тип транспорта, если предмет — наш автомобиль/ГАЗель, иначе null
+    private CarType getItemCarType(ItemStack item) {
+        if (item == null || item.getType() != Material.MINECART || !item.hasItemMeta()) return null;
+        Byte id = item.getItemMeta().getPersistentDataContainer().get(carKey, PersistentDataType.BYTE);
+        return id == null ? null : CarType.fromId(id);
+    }
+
     private boolean isCarItem(ItemStack item) {
-        if (item == null || item.getType() != Material.MINECART || !item.hasItemMeta()) return false;
-        return item.getItemMeta().getPersistentDataContainer().has(carKey, PersistentDataType.BYTE);
+        return getItemCarType(item) != null;
     }
 
     private boolean areHeadlightsOn(Minecart cart) {
@@ -544,24 +804,25 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         };
     }
 
-    private double getGearSpeed(int gear) {
+    private double getGearSpeed(CarType type, int gear) {
         return switch (gear) {
-            case GEAR_REVERSE -> -0.35;
-            case GEAR_FIRST -> 0.42;
-            case GEAR_SECOND -> 0.72;
-            case GEAR_THIRD -> 1.15;
+            case GEAR_REVERSE -> type.speedReverse;
+            case GEAR_FIRST -> type.speed1;
+            case GEAR_SECOND -> type.speed2;
+            case GEAR_THIRD -> type.speed3;
             default -> 0.0;
         };
     }
 
-    private float getGearPitch(int gear) {
-        return switch (gear) {
+    private float getGearPitch(CarType type, int gear) {
+        float base = switch (gear) {
             case GEAR_REVERSE -> 0.40f;
             case GEAR_FIRST -> 0.50f;
             case GEAR_SECOND -> 0.70f;
             case GEAR_THIRD -> 0.95f;
             default -> 0.35f;
         };
+        return base * type.pitchMul;
     }
 
     private int getFuelTicks(Minecart cart) {
@@ -612,8 +873,9 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     }
 
     private Inventory loadTank(Minecart cart) {
+        CarType type = getCarType(cart);
         FuelTankHolder holder = new FuelTankHolder(cart.getUniqueId());
-        Inventory inv = Bukkit.createInventory(holder, 9, Component.text("§8Топливный бак (Уголь)"));
+        Inventory inv = Bukkit.createInventory(holder, type.tankSize, Component.text(type.tankTitle));
         holder.setInventory(inv);
         populateInventoryFromData(cart, tankDataKey, inv);
         return inv;
@@ -624,8 +886,9 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     }
 
     private Inventory loadTrunk(Minecart cart) {
+        CarType type = getCarType(cart);
         TrunkHolder holder = new TrunkHolder(cart.getUniqueId());
-        Inventory inv = Bukkit.createInventory(holder, 27, Component.text("§8Багажник автомобиля"));
+        Inventory inv = Bukkit.createInventory(holder, type.trunkSize, Component.text(type.trunkTitle));
         holder.setInventory(inv);
         populateInventoryFromData(cart, trunkDataKey, inv);
         return inv;
@@ -689,6 +952,9 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     }
 
     private void destroyAndDropCar(Minecart cart) {
+        // Тип нужно запомнить до удаления вагонетки, чтобы выпал правильный предмет
+        CarType type = getCarType(cart);
+
         clearLights(cart.getUniqueId());
         removeCarModel(cart.getUniqueId());
         removeCarHitbox(cart.getUniqueId());
@@ -714,7 +980,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         trackedCars.remove(cart.getUniqueId());
 
         cart.remove();
-        cart.getWorld().dropItemNaturally(cart.getLocation(), createCarItem());
+        cart.getWorld().dropItemNaturally(cart.getLocation(), createCarItem(type));
     }
 
     // ==================== ОБРАБОТКА ВЗАИМОДЕЙСТВИЙ ====================
@@ -816,7 +1082,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             if (event.getCause() == EntityDamageEvent.DamageCause.SUFFOCATION) {
                 event.setCancelled(true);
             } else if (event.getCause() == EntityDamageEvent.DamageCause.FALL) {
-                double reducedDamage = event.getDamage() / 4.0;
+                double reducedDamage = event.getDamage() / getCarType(cart).fallDamageDivisor;
                 if (reducedDamage <= 0.1) {
                     event.setCancelled(true);
                 } else {
@@ -954,7 +1220,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         if (event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
 
         ItemStack item = event.getItem();
-        if (!isCarItem(item)) return;
+        CarType type = getItemCarType(item);
+        if (type == null) return;
 
         Block clicked = event.getClickedBlock();
         if (clicked == null) return;
@@ -963,7 +1230,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         Location spawnLoc = clicked.getRelative(event.getBlockFace()).getLocation().add(0.5, 0.0, 0.5);
         Minecart cart = (Minecart) spawnLoc.getWorld().spawnEntity(spawnLoc, EntityType.MINECART);
-        cart.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, (byte) 1);
+        // Тип записываем ДО создания модели и хитбокса, чтобы они подхватили нужные размеры
+        cart.getPersistentDataContainer().set(carKey, PersistentDataType.BYTE, type.id);
         cart.setCustomNameVisible(false);
         cart.setSilent(true);
         cart.setDerailedVelocityMod(new Vector(0.95, 0.95, 0.95));
@@ -1030,7 +1298,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return block.getY() + 1.0;
     }
 
-    private boolean tryStepUp(Minecart cart, Vector moveDir, double speed) {
+    private boolean tryStepUp(Minecart cart, CarType type, Vector moveDir, double speed) {
         int cd = stepCooldowns.getOrDefault(cart.getUniqueId(), 0);
         if (cd > 0) {
             stepCooldowns.put(cart.getUniqueId(), cd - 1);
@@ -1047,7 +1315,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
 
         Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.45);
-        double[] distances = new double[]{0.55, 0.85, 1.15, 1.40};
+        double[] distances = type.stepDistances;
 
         double targetStepY = -1.0;
 
@@ -1068,7 +1336,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                     double topY = getBlockTopY(b);
                     double diff = topY - currentY;
 
-                    if (diff > 0.04 && diff <= 1.15) {
+                    if (diff > 0.04 && diff <= type.maxStepHeight) {
                         Block above1 = b.getRelative(0, 1, 0);
                         Block above2 = b.getRelative(0, 2, 0);
                         if (isPassable(above1) && isPassable(above2)) {
@@ -1083,8 +1351,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         if (targetStepY > currentY + 0.04) {
             double heightDiff = targetStepY - currentY;
-            double boostY = (heightDiff <= 0.25) ? 0.30 : Math.min(0.64, 0.38 + heightDiff * 0.28);
-            Vector stepVel = moveDir.clone().multiply(Math.max(Math.abs(speed), 0.58)).setY(boostY);
+            double boostY = (heightDiff <= 0.25) ? 0.30 : Math.min(type.stepBoostCap, 0.38 + heightDiff * 0.28);
+            Vector stepVel = moveDir.clone().multiply(Math.max(Math.abs(speed), type.stepMinSpeed)).setY(boostY);
             cart.setVelocity(stepVel);
             stepCooldowns.put(cart.getUniqueId(), 3);
             return true;
@@ -1106,12 +1374,12 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         return next;
     }
 
-    private void updateHeadlights(Minecart cart, Vector forward) {
+    private void updateHeadlights(Minecart cart, CarType type, Vector forward) {
         if (!areHeadlightsOn(cart)) return;
 
         if (tickCounter % 3 == 0) {
-            Vector right = new Vector(-forward.getZ(), 0, forward.getX()).multiply(0.56);
-            Location frontCenter = cart.getLocation().add(forward.clone().multiply(1.32)).add(0, 0.65, 0);
+            Vector right = new Vector(-forward.getZ(), 0, forward.getX()).multiply(type.headlightSide);
+            Location frontCenter = cart.getLocation().add(forward.clone().multiply(type.headlightFront)).add(0, type.headlightHeight, 0);
 
             Location leftLight = frontCenter.clone().subtract(right);
             Location rightLight = frontCenter.clone().add(right);
@@ -1165,12 +1433,13 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     }
 
     private void tickCar(Minecart cart) {
+        CarType type = getCarType(cart);
         Player driver = getDriver(cart);
 
         float carYaw;
         if (driver != null) {
-            // Плавный поворот руля за взглядом водителя (коэффициент 0.35 убирает микро-рывки)
-            carYaw = smoothYaw(cart.getUniqueId(), driver.getEyeLocation().getYaw(), 0.35f);
+            // Плавный поворот руля за взглядом водителя (коэффициент type.steering: у ГАЗели руль «тяжелее»)
+            carYaw = smoothYaw(cart.getUniqueId(), driver.getEyeLocation().getYaw(), type.steering);
             if (Math.abs(cart.getLocation().getYaw() - carYaw) > 0.2f) {
                 cart.setRotation(carYaw, 0f);
             }
@@ -1212,7 +1481,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
             updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
-            updateHeadlights(cart, forward);
+            updateHeadlights(cart, type, forward);
             return;
         }
 
@@ -1224,7 +1493,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
             updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
-            updateHeadlights(cart, forward);
+            updateHeadlights(cart, type, forward);
             return;
         }
 
@@ -1236,13 +1505,13 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 cart.setVelocity(new Vector(velocity.getX() * 0.85, velocity.getY(), velocity.getZ() * 0.85));
             }
             if (tickCounter % 8 == 0) {
-                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
+                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(type.exhaustBack)).add(0, 0.25, 0);
                 cart.getWorld().spawnParticle(Particle.SMOKE, exhaust, 1, 0.05, 0.05, 0.05, 0.01);
                 cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.15f, 0.35f);
             }
             updateCarModel(cart, carYaw);
             updateCarHitbox(cart);
-            updateHeadlights(cart, forward);
+            updateHeadlights(cart, type, forward);
             return;
         }
 
@@ -1251,10 +1520,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         double targetSpeed = 0.0;
 
         if (input.isForward() && !input.isBackward()) {
-            targetSpeed = getGearSpeed(currentGear);
+            targetSpeed = getGearSpeed(type, currentGear);
         }
 
-        int burnRate = input.isForward() ? 2 : 1;
+        int burnRate = input.isForward() ? type.burnForward : 1;
         setFuelTicks(cart, getFuelTicks(cart) - burnRate);
 
         if (tickCounter % 20 == 0) {
@@ -1264,7 +1533,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
 
         if (targetSpeed != 0.0) {
-            Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
+            Location exhaust = cart.getLocation().subtract(forward.clone().multiply(type.exhaustBack)).add(0, 0.25, 0);
             cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.08, 0.05, 0.08, 0.01);
             if (tickCounter % 3 == 0) {
                 cart.getWorld().spawnParticle(Particle.CAMPFIRE_COSY_SMOKE, exhaust, 1, 0.05, 0.05, 0.05, 0.01);
@@ -1273,16 +1542,16 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             if (onGround) {
                 Vector moveDir = targetSpeed > 0 ? forward.clone() : forward.clone().multiply(-1);
 
-                if (!tryStepUp(cart, moveDir, targetSpeed)) {
+                if (!tryStepUp(cart, type, moveDir, targetSpeed)) {
                     // Плавное ускорение и руление (интерполяция скорости вместо мгновенного скачка)
                     Vector targetVel = forward.clone().multiply(targetSpeed);
-                    double smoothX = velocity.getX() + (targetVel.getX() - velocity.getX()) * 0.25;
-                    double smoothZ = velocity.getZ() + (targetVel.getZ() - velocity.getZ()) * 0.25;
+                    double smoothX = velocity.getX() + (targetVel.getX() - velocity.getX()) * type.acceleration;
+                    double smoothZ = velocity.getZ() + (targetVel.getZ() - velocity.getZ()) * type.acceleration;
                     cart.setVelocity(new Vector(smoothX, velocity.getY(), smoothZ));
                 }
 
                 if (tickCounter % 3 == 0) {
-                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, getGearPitch(currentGear));
+                    cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, getGearPitch(type, currentGear));
                 }
             } else {
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
@@ -1292,8 +1561,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 }
             }
         } else {
-            // Плавный накат (0.92) при отпускании газа и уверенное торможение (0.65) при нажатии S
-            double drag = input.isBackward() ? 0.65 : 0.92;
+            // Плавный накат при отпускании газа и торможение при нажатии S (значения зависят от типа транспорта)
+            double drag = input.isBackward() ? type.brakeDrag : type.coastDrag;
             if (onGround) {
                 cart.setVelocity(new Vector(velocity.getX() * drag, velocity.getY(), velocity.getZ() * drag));
             } else {
@@ -1301,13 +1570,13 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
 
             if (input.isForward() && currentGear == GEAR_NEUTRAL) {
-                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
+                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(type.exhaustBack)).add(0, 0.25, 0);
                 cart.getWorld().spawnParticle(Particle.LARGE_SMOKE, exhaust, 1, 0.06, 0.04, 0.06, 0.01);
                 if (tickCounter % 3 == 0) {
                     cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.35f, 0.80f);
                 }
             } else if (tickCounter % 8 == 0) {
-                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(1.45)).add(0, 0.25, 0);
+                Location exhaust = cart.getLocation().subtract(forward.clone().multiply(type.exhaustBack)).add(0, 0.25, 0);
                 cart.getWorld().spawnParticle(Particle.SMOKE, exhaust, 1, 0.05, 0.05, 0.05, 0.01);
                 cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.15f, 0.35f);
             }
@@ -1315,6 +1584,6 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         updateCarModel(cart, carYaw);
         updateCarHitbox(cart);
-        updateHeadlights(cart, forward);
+        updateHeadlights(cart, type, forward);
     }
 }
