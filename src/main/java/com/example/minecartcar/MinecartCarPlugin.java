@@ -92,6 +92,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 "§8Топливный бак (Уголь)", // заголовок бака
                 "§8Багажник автомобиля",   // заголовок багажника
                 1.65f, 1.75f,              // хитбокс взаимодействия: ширина, высота
+                0.0,                       // второй (задний) хитбокс: смещение назад, 0 = не нужен
                 -0.35, 0.42, 0.72, 1.15,   // скорость: R, 1-я, 2-я, 3-я
                 1.0f,                      // множитель тона звука двигателя
                 2,                         // расход топлива (тиков за тик) при нажатом W
@@ -111,7 +112,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 18, 54,
                 "§8Топливный бак ГАЗели (Уголь)",
                 "§8Грузовой отсек ГАЗели",
-                1.95f, 2.25f,
+                2.10f, 2.70f,
+                2.0,
                 -0.28, 0.34, 0.58, 0.90,
                 0.85f,
                 3,
@@ -121,8 +123,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 1.05, 0.50, 0.60,
                 new double[]{0.60, 0.95, 1.30, 1.60},
                 3.0,
-                1.55, 0.70, 0.68,
-                2.00
+                1.62, 0.74, 0.73,
+                3.50
         );
 
         final byte id;
@@ -134,6 +136,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         final String trunkTitle;
         final float hitboxWidth;
         final float hitboxHeight;
+        final double rearHitboxOffset;
         final double speedReverse;
         final double speed1;
         final double speed2;
@@ -156,7 +159,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
 
         CarType(byte id, String recipeKey, String itemName,
                 int tankSize, int trunkSize, String tankTitle, String trunkTitle,
-                float hitboxWidth, float hitboxHeight,
+                float hitboxWidth, float hitboxHeight, double rearHitboxOffset,
                 double speedReverse, double speed1, double speed2, double speed3,
                 float pitchMul, int burnForward,
                 double acceleration, double coastDrag, double brakeDrag, float steering,
@@ -173,6 +176,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             this.trunkTitle = trunkTitle;
             this.hitboxWidth = hitboxWidth;
             this.hitboxHeight = hitboxHeight;
+            this.rearHitboxOffset = rearHitboxOffset;
             this.speedReverse = speedReverse;
             this.speed1 = speed1;
             this.speed2 = speed2;
@@ -221,6 +225,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, Integer> stepCooldowns = new HashMap<>();
     private final Map<UUID, List<BlockDisplay>> carModels = new HashMap<>();
     private final Map<UUID, Interaction> carHitboxes = new HashMap<>();
+    private final Map<UUID, Interaction> carRearHitboxes = new HashMap<>();
     private final Map<UUID, Long> interactionDebounce = new HashMap<>();
     private final Map<UUID, Float> smoothedYaw = new HashMap<>();
 
@@ -357,6 +362,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             removeCarHitbox(id);
         }
         carHitboxes.clear();
+        carRearHitboxes.clear();
 
         trackedCars.clear();
         stepCooldowns.clear();
@@ -368,27 +374,53 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
     private void spawnCarHitbox(Minecart cart) {
         removeCarHitbox(cart.getUniqueId());
         CarType type = getCarType(cart);
-        Interaction hitbox = (Interaction) cart.getWorld().spawnEntity(cart.getLocation(), EntityType.INTERACTION);
+        UUID carId = cart.getUniqueId();
+
+        carHitboxes.put(carId, createHitbox(cart, type, cart.getLocation()));
+
+        // Длинным машинам нужен второй хитбокс сзади, иначе до кузова не достать
+        if (type.rearHitboxOffset > 0) {
+            float yaw = smoothedYaw.getOrDefault(carId, cart.getLocation().getYaw());
+            carRearHitboxes.put(carId, createHitbox(cart, type, getRearHitboxLocation(cart, type, yaw)));
+        }
+    }
+
+    private Interaction createHitbox(Minecart cart, CarType type, Location at) {
+        Interaction hitbox = (Interaction) cart.getWorld().spawnEntity(at, EntityType.INTERACTION);
         hitbox.setInteractionWidth(type.hitboxWidth);
         hitbox.setInteractionHeight(type.hitboxHeight);
         hitbox.setResponsive(true);
         hitbox.getPersistentDataContainer().set(hitboxKey, PersistentDataType.STRING, cart.getUniqueId().toString());
-        carHitboxes.put(cart.getUniqueId(), hitbox);
+        return hitbox;
     }
 
-    private void updateCarHitbox(Minecart cart) {
-        Interaction hitbox = carHitboxes.get(cart.getUniqueId());
-        if (hitbox == null || !hitbox.isValid()) {
+    private Location getRearHitboxLocation(Minecart cart, CarType type, float yaw) {
+        return cart.getLocation().subtract(getCarForwardVector(yaw).multiply(type.rearHitboxOffset));
+    }
+
+    private void updateCarHitbox(Minecart cart, CarType type, float yaw) {
+        UUID carId = cart.getUniqueId();
+        Interaction hitbox = carHitboxes.get(carId);
+        Interaction rear = carRearHitboxes.get(carId);
+        boolean needRear = type.rearHitboxOffset > 0;
+        if (hitbox == null || !hitbox.isValid() || (needRear && (rear == null || !rear.isValid()))) {
             spawnCarHitbox(cart);
             return;
         }
-        // Перемещаем хитбокс только когда в машине нет водителя, чтобы избежать лишних пакетов при быстрой езде
-        if (getDriver(cart) == null) {
-            if (hitbox.getLocation().distanceSquared(cart.getLocation()) > 0.01) {
-                hitbox.teleport(cart.getLocation());
-            }
-        } else if (tickCounter % 5 == 0) {
-            hitbox.teleport(cart.getLocation());
+        // Пока водитель едет, хитбоксы подтягиваем раз в 5 тиков, чтобы не слать лишние пакеты;
+        // на стоянке двигаем только при реальном смещении
+        boolean driven = getDriver(cart) != null;
+        if (driven && tickCounter % 5 != 0) return;
+
+        syncHitbox(hitbox, cart.getLocation(), driven);
+        if (needRear) {
+            syncHitbox(rear, getRearHitboxLocation(cart, type, yaw), driven);
+        }
+    }
+
+    private void syncHitbox(Interaction hitbox, Location target, boolean force) {
+        if (force || hitbox.getLocation().distanceSquared(target) > 0.01) {
+            hitbox.teleport(target);
         }
     }
 
@@ -396,6 +428,10 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         Interaction hitbox = carHitboxes.remove(carId);
         if (hitbox != null && hitbox.isValid()) {
             hitbox.remove();
+        }
+        Interaction rear = carRearHitboxes.remove(carId);
+        if (rear != null && rear.isValid()) {
+            rear.remove();
         }
     }
 
@@ -545,103 +581,107 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 0.42f, -0.20f, -1.46f, 0.14f, 0.14f, 0.20f, "exhaust"));
     }
 
-    // ---------- ГАЗель: белый фургон с синей полосой ----------
-    // Ось Z: вперёд = +Z. Кабина (водитель в точке 0,0) занимает Z -0.55..0.64,
-    // капот до Z 1.50, грузовой фургон позади кабины Z -1.76..-0.55.
-    // Высота кабины такая же, как у легковушки, а грузовой отсек выше (до Y 2.10).
+    // ---------- ГАЗель: бортовой грузовик с синим тентом ----------
+    // Ось Z: вперёд = +Z. Белая кабина (водитель в точке 0,0) занимает Z -0.80..1.50.
+    // Позади кабины серый борт и синий тент: Z -3.25..-0.80, верх тента на Y 2.55.
+    // Ширина 2.0 (X ±1.0); нижняя точка колёс Y -0.35 — как у легковушки.
 
     private void buildGazelleModel(Minecart cart, List<BlockDisplay> parts) {
-        // Рама, кузов, капот, крыша кабины и высокий грузовой отсек
+        // Рама
         parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
-                -0.84f, -0.34f, -1.70f, 1.68f, 0.28f, 3.16f, "chassis"));
-        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
-                -0.90f, -0.06f, -1.75f, 1.80f, 0.58f, 3.25f, "body"));
-        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
-                -0.86f, 0.52f, 0.64f, 1.72f, 0.14f, 0.82f, "hood"));
-        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
-                -0.88f, 1.48f, -0.55f, 1.76f, 0.14f, 1.21f, "roof"));
-        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
-                -0.91f, 0.52f, -1.76f, 1.82f, 1.58f, 1.21f, "cargo_box"));
+                -0.86f, -0.12f, -3.25f, 1.72f, 0.24f, 4.70f, "chassis"));
 
-        // Стёкла
+        // Белая кабина: низ, «носик» капота и крыша
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -1.00f, 0.12f, -0.80f, 2.00f, 0.50f, 2.30f, "body"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -0.86f, 0.62f, 1.06f, 1.72f, 0.14f, 0.40f, "hood"));
+        parts.add(createModelPart(cart, Material.WHITE_CONCRETE,
+                -1.00f, 1.70f, -0.80f, 2.00f, 0.14f, 1.90f, "roof"));
+
+        // Стёкла кабины
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
-                -0.80f, 0.52f, 0.58f, 1.60f, 0.96f, 0.06f, "windshield"));
+                -0.92f, 0.62f, 1.00f, 1.84f, 1.08f, 0.06f, "windshield"));
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
-                -0.86f, 0.52f, -0.55f, 0.06f, 0.96f, 1.11f, "side_glass_l"));
+                -0.94f, 0.62f, -0.80f, 0.06f, 1.08f, 1.80f, "side_glass_l"));
         parts.add(createModelPart(cart, Material.TINTED_GLASS,
-                0.80f, 0.52f, -0.55f, 0.06f, 0.96f, 1.11f, "side_glass_r"));
-        parts.add(createModelPart(cart, Material.TINTED_GLASS,
-                -0.70f, 1.30f, -1.795f, 1.40f, 0.55f, 0.035f, "rear_window"));
+                0.88f, 0.62f, -0.80f, 0.06f, 1.08f, 1.80f, "side_glass_r"));
 
         // Стойки кабины
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -0.89f, 0.52f, 0.53f, 0.11f, 0.96f, 0.12f, "pillar_fl"));
+                -0.98f, 0.62f, 0.96f, 0.14f, 1.08f, 0.14f, "pillar_fl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                0.78f, 0.52f, 0.53f, 0.11f, 0.96f, 0.12f, "pillar_fr"));
+                0.84f, 0.62f, 0.96f, 0.14f, 1.08f, 0.14f, "pillar_fr"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -0.89f, 0.52f, -0.55f, 0.11f, 0.96f, 0.12f, "pillar_rl"));
+                -0.98f, 0.62f, -0.80f, 0.14f, 1.08f, 0.14f, "pillar_rl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                0.78f, 0.52f, -0.55f, 0.11f, 0.96f, 0.12f, "pillar_rr"));
+                0.84f, 0.62f, -0.80f, 0.14f, 1.08f, 0.14f, "pillar_rr"));
 
-        // Бамперы и решётка
-        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
-                -0.94f, -0.18f, 1.46f, 1.88f, 0.26f, 0.14f, "bumper_f"));
-        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
-                -0.94f, -0.18f, -1.90f, 1.88f, 0.26f, 0.14f, "bumper_r"));
+        // Грузовая платформа с серыми бортами, синий тент и тёмно-синяя «юбка» тента
+        parts.add(createModelPart(cart, Material.LIGHT_GRAY_CONCRETE,
+                -1.00f, 0.12f, -3.25f, 2.00f, 0.68f, 2.45f, "cargo_bed"));
+        parts.add(createModelPart(cart, Material.BLUE_WOOL,
+                -0.98f, 0.80f, -3.20f, 1.96f, 1.75f, 2.40f, "tent"));
+        parts.add(createModelPart(cart, Material.BLUE_CONCRETE,
+                -1.00f, 0.80f, -3.22f, 2.00f, 0.16f, 2.40f, "tent_skirt"));
+
+        // Бамперы и решётка радиатора
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -1.04f, -0.14f, 1.50f, 2.08f, 0.34f, 0.16f, "bumper_f"));
+        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
+                -1.04f, -0.14f, -3.41f, 2.08f, 0.34f, 0.16f, "bumper_r"));
         parts.add(createModelPart(cart, Material.POLISHED_ANDESITE,
-                -0.50f, 0.10f, 1.48f, 1.00f, 0.30f, 0.06f, "grille"));
+                -0.40f, 0.20f, 1.50f, 0.80f, 0.32f, 0.05f, "grille"));
 
-        // Фары (имена headlight_l / headlight_r нужны для переключения света на F)
+        // Фары: тёмные рамки и «лампы» (имена headlight_l / headlight_r нужны для переключения света на F)
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                -0.94f, 0.17f, 1.50f, 0.40f, 0.40f, 0.04f, "headlight_frame_l"));
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                0.54f, 0.17f, 1.50f, 0.40f, 0.40f, 0.04f, "headlight_frame_r"));
         Material hlMat = areHeadlightsOn(cart) ? Material.SEA_LANTERN : Material.WHITE_STAINED_GLASS;
         parts.add(createModelPart(cart, hlMat,
-                -0.84f, 0.22f, 1.48f, 0.24f, 0.20f, 0.06f, "headlight_l"));
+                -0.88f, 0.23f, 1.54f, 0.28f, 0.28f, 0.04f, "headlight_l"));
         parts.add(createModelPart(cart, hlMat,
-                0.60f, 0.22f, 1.48f, 0.24f, 0.20f, 0.06f, "headlight_r"));
+                0.60f, 0.23f, 1.54f, 0.28f, 0.28f, 0.04f, "headlight_r"));
 
-        // Задние фонари
+        // Задние фонари на борту платформы
         parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
-                -0.86f, 0.28f, -1.81f, 0.18f, 0.34f, 0.05f, "taillight_l"));
+                -0.90f, 0.30f, -3.30f, 0.20f, 0.36f, 0.05f, "taillight_l"));
         parts.add(createModelPart(cart, Material.REDSTONE_BLOCK,
-                0.68f, 0.28f, -1.81f, 0.18f, 0.34f, 0.05f, "taillight_r"));
+                0.70f, 0.30f, -3.30f, 0.20f, 0.36f, 0.05f, "taillight_r"));
 
-        // Колёса (крупнее, чем у легковушки) и диски
+        // Колёса: большие, задние шире (имитация сдвоенных скатов) + диски
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -1.02f, -0.35f, 0.66f, 0.22f, 0.58f, 0.58f, "wheel_fl"));
+                -1.14f, -0.35f, 0.45f, 0.30f, 0.80f, 0.80f, "wheel_fl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                0.80f, -0.35f, 0.66f, 0.22f, 0.58f, 0.58f, "wheel_fr"));
+                0.84f, -0.35f, 0.45f, 0.30f, 0.80f, 0.80f, "wheel_fr"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -1.02f, -0.35f, -1.44f, 0.22f, 0.58f, 0.58f, "wheel_rl"));
+                -1.16f, -0.35f, -2.75f, 0.44f, 0.80f, 0.80f, "wheel_rl"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                0.80f, -0.35f, -1.44f, 0.22f, 0.58f, 0.58f, "wheel_rr"));
+                0.72f, -0.35f, -2.75f, 0.44f, 0.80f, 0.80f, "wheel_rr"));
 
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
-                -1.04f, -0.19f, 0.82f, 0.04f, 0.26f, 0.26f, "hub_fl"));
+                -1.16f, -0.12f, 0.68f, 0.04f, 0.34f, 0.34f, "hub_fl"));
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
-                1.00f, -0.19f, 0.82f, 0.04f, 0.26f, 0.26f, "hub_fr"));
+                1.12f, -0.12f, 0.68f, 0.04f, 0.34f, 0.34f, "hub_fr"));
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
-                -1.04f, -0.19f, -1.28f, 0.04f, 0.26f, 0.26f, "hub_rl"));
+                -1.18f, -0.12f, -2.52f, 0.04f, 0.34f, 0.34f, "hub_rl"));
         parts.add(createModelPart(cart, Material.IRON_BLOCK,
-                1.00f, -0.19f, -1.28f, 0.04f, 0.26f, 0.26f, "hub_rr"));
+                1.14f, -0.12f, -2.52f, 0.04f, 0.34f, 0.34f, "hub_rr"));
 
-        // Выхлопная труба
+        // Выхлопная труба сзади справа
         parts.add(createModelPart(cart, Material.NETHERITE_BLOCK,
-                0.55f, -0.22f, -1.96f, 0.16f, 0.16f, 0.22f, "exhaust"));
+                0.55f, -0.30f, -3.50f, 0.18f, 0.18f, 0.40f, "exhaust"));
 
-        // Синяя полоса по бортам фургона
-        parts.add(createModelPart(cart, Material.BLUE_CONCRETE,
-                -0.93f, 0.85f, -1.75f, 0.02f, 0.22f, 1.18f, "stripe_l"));
-        parts.add(createModelPart(cart, Material.BLUE_CONCRETE,
-                0.91f, 0.85f, -1.75f, 0.02f, 0.22f, 1.18f, "stripe_r"));
-
-        // Стык задних дверей
+        // Боковые зеркала и подножки кабины
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -0.025f, 0.20f, -1.805f, 0.05f, 1.85f, 0.045f, "rear_door_seam"));
-
-        // Боковые зеркала
+                -1.18f, 1.00f, 0.92f, 0.22f, 0.40f, 0.12f, "mirror_l"));
         parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                -1.03f, 0.95f, 0.50f, 0.14f, 0.28f, 0.10f, "mirror_l"));
-        parts.add(createModelPart(cart, Material.BLACK_CONCRETE,
-                0.89f, 0.95f, 0.50f, 0.14f, 0.28f, 0.10f, "mirror_r"));
+                0.96f, 1.00f, 0.92f, 0.22f, 0.40f, 0.12f, "mirror_r"));
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                -1.08f, 0.02f, -0.50f, 0.12f, 0.10f, 0.90f, "step_l"));
+        parts.add(createModelPart(cart, Material.GRAY_CONCRETE,
+                0.96f, 0.02f, -0.50f, 0.12f, 0.10f, 0.90f, "step_r"));
     }
 
     private void updateCarModel(Minecart cart, float yaw) {
@@ -710,7 +750,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             lore.add(Component.text("§eShift + ЛКМ снаружи — багажник (" + type.trunkSize + " слотов)"));
             lore.add(Component.text("§eПробел — завести | F — фары | Ctrl+1/2/3/4/Q — КПП"));
             if (type == CarType.GAZELLE) {
-                lore.add(Component.text("§7Грузовой фургон: медленнее легковушки, но вместительнее"));
+                lore.add(Component.text("§7Бортовой грузовик с тентом: медленнее легковушки, но вместительнее"));
             }
             meta.lore(lore);
 
@@ -1480,7 +1520,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 cart.setVelocity(new Vector(velocity.getX() * 0.98, velocity.getY(), velocity.getZ() * 0.98));
             }
             updateCarModel(cart, carYaw);
-            updateCarHitbox(cart);
+            updateCarHitbox(cart, type, carYaw);
             updateHeadlights(cart, type, forward);
             return;
         }
@@ -1492,7 +1532,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 driver.sendActionBar(Component.text("§cТопливо закончилось! Двигатель заглох (Shift+ПКМ — заправить уголь)"));
             }
             updateCarModel(cart, carYaw);
-            updateCarHitbox(cart);
+            updateCarHitbox(cart, type, carYaw);
             updateHeadlights(cart, type, forward);
             return;
         }
@@ -1510,7 +1550,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 cart.getWorld().playSound(cart.getLocation(), Sound.ENTITY_MINECART_RIDING, 0.15f, 0.35f);
             }
             updateCarModel(cart, carYaw);
-            updateCarHitbox(cart);
+            updateCarHitbox(cart, type, carYaw);
             updateHeadlights(cart, type, forward);
             return;
         }
@@ -1583,7 +1623,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
         }
 
         updateCarModel(cart, carYaw);
-        updateCarHitbox(cart);
+        updateCarHitbox(cart, type, carYaw);
         updateHeadlights(cart, type, forward);
     }
 }
