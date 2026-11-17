@@ -99,7 +99,7 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                 0.25,                      // разгон (0..1, чем больше — тем резче)
                 0.92, 0.65,                // накат без газа, торможение на S (множитель скорости за тик)
                 0.35f,                     // отзывчивость руля (0..1, чем меньше — тем неповоротливее)
-                1.15, 0.58, 0.64,          // подъём на блоки: макс. высота, мин. скорость, макс. вертикальный импульс
+                1.15, 0.58, 0.64,          // подъём на блоки: макс. высота, мин. скорость (вертикальный импульс больше не используется)
                 new double[]{0.55, 0.85, 1.15, 1.40}, // дистанции проверки препятствий впереди
                 4.0,                       // делитель урона от падения для водителя
                 1.32, 0.56, 0.65,          // фары (частицы): вынос вперёд, разнос по бокам, высота
@@ -1354,11 +1354,19 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
             }
         }
 
+        // Над головой должно быть свободно, иначе после подъёма машина врежется в потолок
+        Block headroom1 = cart.getLocation().add(0, 1, 0).getBlock();
+        Block headroom2 = cart.getLocation().add(0, 2, 0).getBlock();
+        if (!isPassable(headroom1) || !isPassable(headroom2)) {
+            return false;
+        }
+
         Vector side = new Vector(-moveDir.getZ(), 0, moveDir.getX()).multiply(0.45);
         double[] distances = type.stepDistances;
 
-        double targetStepY = -1.0;
-
+        // Ищем ближайшее препятствие: перебираем дистанции от ближней к дальней и
+        // останавливаемся на первой, где нашлась ступенька. Так машина поднимается
+        // ровно перед барьером, а не «заранее» в паре блоков от него.
         for (double dist : distances) {
             Location center = cart.getLocation().add(moveDir.clone().multiply(dist));
             Location[] points = new Location[]{
@@ -1366,6 +1374,8 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                     center.clone().add(side),
                     center.clone().subtract(side)
             };
+
+            double targetStepY = -1.0;
 
             for (Location pt : points) {
                 for (int dy = -1; dy <= 1; dy++) {
@@ -1387,15 +1397,24 @@ public class MinecartCarPlugin extends JavaPlugin implements Listener {
                     }
                 }
             }
-        }
 
-        if (targetStepY > currentY + 0.04) {
-            double heightDiff = targetStepY - currentY;
-            double boostY = (heightDiff <= 0.25) ? 0.30 : Math.min(type.stepBoostCap, 0.38 + heightDiff * 0.28);
-            Vector stepVel = moveDir.clone().multiply(Math.max(Math.abs(speed), type.stepMinSpeed)).setY(boostY);
-            cart.setVelocity(stepVel);
-            stepCooldowns.put(cart.getUniqueId(), 3);
-            return true;
+            if (targetStepY > currentY + 0.04) {
+                // Подъём «как у лошади»: без прыжка по дуге. Мгновенно ставим машину
+                // на высоту ступеньки, сохраняя горизонтальный ход — она продолжает
+                // ехать вперёд и докатывается на ступеньку.
+                double hSpeed = Math.max(Math.abs(speed), type.stepMinSpeed);
+
+                Location target = cart.getLocation().clone();
+                target.setY(targetStepY + 0.02);
+                // Небольшой сдвиг вперёд, чтобы машина приземлилась на ступеньку,
+                // а не обратно на прежний грунт
+                target.add(moveDir.clone().multiply(Math.min(0.35, hSpeed * 0.5)));
+
+                cart.teleport(target);
+                cart.setVelocity(new Vector(moveDir.getX() * hSpeed, 0, moveDir.getZ() * hSpeed));
+                stepCooldowns.put(cart.getUniqueId(), 2);
+                return true;
+            }
         }
         return false;
     }
